@@ -123,9 +123,20 @@ numbers and its practice implication.
   window dates score ~6-8/10.
 * **The NotebookLM prompt must carry the real window dates** — the header strip
   is quoted from the computed window, otherwise the generator invents its own
-  date range.
-* **Gemini has two backends:** `gemini.py` (cookie web session) first, then a
-  free-tier AI Studio key via plain urllib, so a dead cookie cannot kill a run.
+  date range. NotebookLM rotates `__Secure-1PSIDTS` on use, so a harvested jar
+  covers roughly **one** CI session: harvest immediately before the run
+  (`nlm_cdp_harvest.py`, or the Hermes cron `NLM jar top-up for GI-hep digest`
+  at Mon 08:45 HKT which runs `nlm_gihep_topup.sh`). When the jar is stale the
+  run still emails the report with the chart and says the infographic was
+  unavailable — never let it fail the digest.
+* **Generate the artifact first, reuse only on the daily cap.** Reusing "today's
+  artifact" before generating serves a stale image whenever the prompt or the
+  sources changed (the vendored `digest_infographic.nlm_generate_infographic`
+  does pre-reuse; `_nlm_generate()` in `gi_hep_weekly.py` deliberately does not).
+* **`digest_infographic.py` / `nlm.py` / `gemini.py` / `urllib_session.py` are
+  vendored** from the sibling digests (`arxiv-gem-digest`,
+  `yt-finance-digest`). Do not fork their behaviour inside `gi_hep_weekly.py`;
+  extend the vendored helpers so all three digests keep the same NLM fixes.
 * **Never fail silently:** no items *and* a source error → WARN email + exit 2.
 * **Dedup cache key must stay rolling** (`gihep-seen-${{ github.run_id }}` +
   `restore-keys: gihep-seen-`); a fixed key always hits, a hit skips the save,
