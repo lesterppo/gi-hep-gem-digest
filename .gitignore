@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+state/seen_ids.json
+state/digest_*.md
+state/*.png
+smtp_pass.txt
+.env

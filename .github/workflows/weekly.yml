@@ -1,0 +1,116 @@
+name: GI & Hepatology Weekly Digest (Gemini)
+
+on:
+  schedule:
+    - cron: "30 1 * * 1"  # Monday 09:30 HKT = Monday 01:30 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1 = exercise the pipeline but do NOT send the email"
+        required: false
+        default: ""
+        type: string
+      back_days:
+        description: "Override the look-back window in days (default 14)"
+        required: false
+        default: ""
+        type: string
+      max_items:
+        description: "Override how many items are analysed (default 34)"
+        required: false
+        default: ""
+        type: string
+      fetch_source:
+        description: "auto (default) | pubmed | epmc — pin the fetch tier"
+        required: false
+        default: ""
+        type: string
+      ignore_seen:
+        description: "1 = ignore the seen-PMID cache (re-analyse everything)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: gi-hep-digest
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Setup Gemini auth (env cookies -> auth.json)
+        env:
+          GEMINI_SID: ${{ secrets.GEMINI_SID }}
+          GEMINI_TS: ${{ secrets.GEMINI_TS }}
+        run: |
+          mkdir -p ~/.gemini-cli
+          printf '{"__Secure-1PSID":"%s","__Secure-1PSIDTS":"%s"}\n' \
+            "$GEMINI_SID" "$GEMINI_TS" > ~/.gemini-cli/auth.json
+          python3 -c "import json;d=json.load(open('$HOME/.gemini-cli/auth.json'));print('gemini cookies:', 1 if d.get('__Secure-1PSID') else 0)"
+
+      - name: Setup NotebookLM session (storage state)
+        env:
+          NLM_STORAGE_STATE_GZ: ${{ secrets.NLM_STORAGE_STATE_GZ }}
+        run: |
+          mkdir -p ~/.notebooklm/profiles/default
+          printf '%s' "$NLM_STORAGE_STATE_GZ" | base64 -d | gunzip > \
+            ~/.notebooklm/profiles/default/storage_state.json
+          python3 -c "import json;d=json.load(open('$HOME/.notebooklm/profiles/default/storage_state.json'));print('nlm cookies:',len(d.get('cookies',[])))"
+
+      - name: Install playwright (NotebookLM image download)
+        run: |
+          pip install playwright
+          python3 -m playwright install chromium --with-deps
+
+      - name: Restore seen-PMID state
+        uses: actions/cache@v4
+        with:
+          path: state
+          # Rolling key: a fixed key always HITS, and a hit skips the save, so
+          # the dedup state would freeze and every run would re-report the
+          # whole window. Unique key + prefix restore keeps the newest snapshot
+          # flowing to the next run.
+          key: gihep-seen-${{ github.run_id }}
+          restore-keys: gihep-seen-
+
+      - name: Run GI & Hepatology weekly digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RECIPIENT: ${{ secrets.RECIPIENT }}
+          NOTEBOOKLM_TRANSPORT: curl_cffi
+          RUN_BACK_DAYS: ${{ github.event.inputs.back_days }}
+          ANALYSIS_MAX_ITEMS: ${{ github.event.inputs.max_items }}
+          FETCH_SOURCE: ${{ github.event.inputs.fetch_source }}
+          DIGEST_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          SEEN_STATE_IGNORE: ${{ github.event.inputs.ignore_seen }}
+        run: |
+          if [ "$SEEN_STATE_IGNORE" = "1" ]; then rm -f state/seen_ids.json; fi
+          python3 gi_hep_weekly.py
+
+      - name: Upload digest artifacts (QA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gihep-digest-output
+          path: |
+            ~/.hermes/digest_images/
+            /tmp/gihep_digest_email.html
+            state/digest_b*.md
+          if-no-files-found: ignore
+          retention-days: 7
