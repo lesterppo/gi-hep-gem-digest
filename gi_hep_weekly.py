@@ -924,11 +924,15 @@ def gihep_notebook_context(items: list, digest_text: str,
     kinds: dict = {}
     for it in items:
         kinds[it["kind"]] = kinds.get(it["kind"], 0) + 1
+    singular = {"guideline": "guideline", "consensus": "consensus statement",
+                "trial": "trial", "meta-analysis": "meta-analysis",
+                "systematic review": "systematic review", "study": "study"}
     plural = {"guideline": "guidelines", "consensus": "consensus statements",
               "trial": "trials", "meta-analysis": "meta-analyses",
               "systematic review": "systematic reviews", "study": "studies"}
-    counts = ", ".join(f"{v} {plural.get(k, k + 's')}"
-                       for k, v in sorted(kinds.items()))
+    counts = ", ".join(
+        f"{v} {(singular if v == 1 else plural).get(k, k + 's')}"
+        for k, v in sorted(kinds.items()))
     header = (f"GI & Hepatology Weekly — {date_range} — {len(items)} "
               f"items ({counts})")
     return (
