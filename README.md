@@ -26,8 +26,18 @@ GitHub Actions (Mon 01:30 UTC)
   │     "Guideline watch"
   ├── Infographics:
   │     1. matplotlib evidence-mix chart (type / journal / issuing body counts)
-  │     2. Gemini NotebookLM clinical dashboard built from the item sources
-  └── One HTML email (text summary + both infographics inline)
+  │     2. Gemini NotebookLM dashboard — "Guidance & consensus"
+  │     3. Gemini NotebookLM dashboard — "Trials & meta-analyses"
+  │     4. Gemini NotebookLM dashboard — "Practice signals"
+  └── One HTML email (text summary + all infographics inline)
+
+The week is split into THREE NotebookLM dashboards on purpose: one artifact
+covering every item has to cram, which is where garbled text and dropped
+sections come from. Each dashboard gets its own notebook (dated), its own
+source set (guidance / studies / cross-cutting) and its own deep instruction
+set — every guideline card carries 3 recommendation bullets, every study card
+carries its headline numbers, and the signals dashboard says what to change,
+what to verify and what to watch. `NLM_ARTIFACTS` caps how many are generated.
 ```
 
 **No ranking, no scoring** — every item in the window is reported with its
@@ -91,6 +101,7 @@ numbers and its practice implication.
 | `ABSTRACT_CHARS` | `1500` | Abstract characters sent per item |
 | `GEMINI_MODEL` / `GEMINI_THINKING` | `flash` / `extended` | Web backend |
 | `GEMINI_API_MODEL` | `gemini-3.5-flash` | API fallback (then flash-lite, 2.5-flash) |
+| `NLM_ARTIFACTS` | `3` | How many NotebookLM dashboards to generate (guidance / trials / signals) |
 | `FETCH_SOURCE` | `auto` | `pubmed` \| `epmc` pins the tier |
 | `DIGEST_LANG` | `en` | `zh-Hant` writes the report in Traditional Chinese |
 | `DIGEST_DRY_RUN` | *(unset)* | `1` = run everything, send nothing |
@@ -123,12 +134,16 @@ numbers and its practice implication.
   window dates score ~6-8/10.
 * **The NotebookLM prompt must carry the real window dates** — the header strip
   is quoted from the computed window, otherwise the generator invents its own
-  date range. NotebookLM rotates `__Secure-1PSIDTS` on use, so a harvested jar
-  covers roughly **one** CI session: harvest immediately before the run
-  (`nlm_cdp_harvest.py`, or the Hermes cron `NLM jar top-up for GI-hep digest`
-  at Mon 08:45 HKT which runs `nlm_gihep_topup.sh`). When the jar is stale the
-  run still emails the report with the chart and says the infographic was
-  unavailable — never let it fail the digest.
+  date range.
+* **NotebookLM rotates its session token on use**, so a harvested jar covers
+  roughly **one** CI session. The fix is one harvest per morning, straight
+  before the run slots — `nlm_digests_pre_run.sh` (Hermes cron, daily 09:15 HKT,
+  covers all three digest repos) runs `nlm_cdp_harvest.py`, which verifies the
+  jar with a live RPC before publishing it. Deliberately **not** hourly: each
+  harvest consumes the token it is meant to protect, so more frequent refresh
+  makes things worse, not better. If the jar is stale the digest is designed to
+  still ship — drop to the locally rendered poster, say so in the email, and
+  never fail the run.
 * **Generate the artifact first, reuse only on the daily cap.** Reusing "today's
   artifact" before generating serves a stale image whenever the prompt or the
   sources changed (the vendored `digest_infographic.nlm_generate_infographic`

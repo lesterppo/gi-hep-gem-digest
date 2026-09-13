@@ -27,6 +27,13 @@ import sys
 import tempfile
 from datetime import datetime
 
+sys.path.insert(0, os.path.expanduser("~/.hermes/scripts"))
+try:
+    from gh_env import gh_env
+except Exception:  # pragma: no cover
+    def gh_env():
+        return dict(os.environ)
+
 HOME = os.path.expanduser("~")
 STORAGE = os.path.join(HOME, ".notebooklm", "profiles", "default",
                        "storage_state.json")
@@ -133,7 +140,7 @@ def main() -> int:
                     p = subprocess.run(
                         ["gh", "secret", "set", "NLM_STORAGE_STATE_GZ", "-R",
                          repo, "--body", blob],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, env=gh_env())
                     log(f"push {repo}: "
                         f"{'ok' if p.returncode == 0 else p.stderr[:150]}")
                     rc |= p.returncode

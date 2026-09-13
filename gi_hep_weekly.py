@@ -820,7 +820,166 @@ def render_evidence_chart(items: list[dict], out_dir: str) -> str:
     return out
 
 
+
+# ── Infographic fallback: clinical poster (no auth needed) ───────────────────
+def render_clinical_poster(items: list, digest_text: str, date_range: str,
+                           out_dir: str) -> str:
+    """Text-and-layout clinical poster rendered locally.
+
+    The NotebookLM dashboard needs a live browser session; this keeps the
+    promise that every digest carries a comprehensive infographic even when
+    that session is stale (the evidence-mix chart alone is not a summary)."""
+    from textwrap import wrap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    WIDTH, MAX_LINES = 62, 3          # body wrap width / max body lines
+    IMP_W, IMP_LINES = 74, 2          # 'Do:' line width / max lines
+    LINE_H = 0.0192                   # figure fraction per 8.6pt line
+    HDR_H, PAD = 0.050, 0.012
+
+    notes = parse_digest_notes(digest_text)
+    guide = [it for it in items if it["kind"] in ("guideline", "consensus")][:5]
+    study = [it for it in items
+             if it["kind"] in ("trial", "meta-analysis", "systematic review")][:4]
+    shown = {it["pmid"] for it in guide + study}
+    rest = [it for it in items if it["pmid"] not in shown]
+
+    fig = plt.figure(figsize=(16.0, 9.0), dpi=150)
+    fig.patch.set_facecolor("#f7f9fb")
+    ink, navy, teal, grey = "#1f2328", "#1e4e79", "#2e8b8b", "#5b6b7c"
+    fig.patches.append(Rectangle((0.0, 0.902), 1.0, 0.098,
+                                transform=fig.transFigure, facecolor="#12283d",
+                                edgecolor="none", zorder=0))
+    fig.text(0.025, 0.945, "GI & Hepatology Weekly",
+             fontsize=20, weight="bold", color="white")
+    fig.text(0.025, 0.915,
+             "Guidelines, consensus statements and clinical studies newly "
+             "indexed in PubMed", fontsize=10.5, color="#c8d6e2")
+    kinds: dict = {}
+    for it in items:
+        kinds[it["kind"]] = kinds.get(it["kind"], 0) + 1
+    singular = {"guideline": "guideline", "consensus": "consensus statement",
+                "trial": "trial", "meta-analysis": "meta-analysis",
+                "systematic review": "systematic review", "study": "study"}
+    plural = {"guideline": "guidelines", "consensus": "consensus statements",
+              "trial": "trials", "meta-analysis": "meta-analyses",
+              "systematic review": "systematic reviews", "study": "studies"}
+    mix = ", ".join(f"{v} {(singular if v == 1 else plural).get(k, k + 's')}"
+                    for k, v in sorted(kinds.items()))
+    fig.text(0.025, 0.876, f"{date_range}   |   {len(items)} items: {mix}",
+             fontsize=10, color=grey)
+
+    def trim(text: str) -> list:
+        """Wrap to the body width and keep at most MAX_LINES lines."""
+        out = wrap((text or "").strip(), WIDTH)
+        if len(out) > MAX_LINES:
+            out = out[:MAX_LINES]
+            out[-1] = out[-1][:WIDTH - 1].rstrip() + "\u2026"
+        return out
+
+    def trim_impact(text: str) -> list:
+        out = wrap((text or "").strip(), IMP_W)
+        if len(out) > IMP_LINES:
+            out = out[:IMP_LINES]
+            out[-1] = out[-1][:IMP_W - 1].rstrip() + "\u2026"
+        return out
+
+    def card_height(body: str, impact: str) -> float:
+        """Single source of truth for card geometry so the fit check and the
+        drawing pass can never disagree (they did, and text spilled)."""
+        ilines = trim_impact(impact)
+        return (HDR_H + LINE_H * len(trim(body))
+                + (PAD + LINE_H * len(ilines) if ilines else 0))
+
+    def card(x: float, y: float, w: float, title: str, meta: str,
+             body: str, impact: str) -> float:
+        lines = trim(body)
+        ilines = trim_impact(impact)
+        h = card_height(body, impact)
+        fig.patches.append(Rectangle((x, y - h), w, h,
+                                    transform=fig.transFigure,
+                                    facecolor="white", edgecolor="#e3e8ee",
+                                    linewidth=1.0, zorder=1))
+        fig.text(x + 0.012, y - 0.026, " ".join(wrap(title, 70)[:2]),
+                 fontsize=10.2, weight="bold", color=navy, zorder=2,
+                 linespacing=1.3)
+        fig.text(x + 0.012, y - 0.047, meta[:86], fontsize=8, color=grey,
+                 zorder=2)
+        if lines:
+            fig.text(x + 0.012, y - HDR_H - 0.004, "\n".join(lines),
+                     fontsize=8.6, color=ink, va="top", linespacing=1.35,
+                     zorder=2)
+        if ilines:
+            fig.text(x + 0.012, y - h + 0.008, "\n".join("Do: " + ilines[0]
+                     if i == 0 else ilines[i] for i in range(len(ilines))),
+                     fontsize=8.6, color=teal, weight="bold", zorder=2,
+                     linespacing=1.3)
+        return h
+
+    left_x, right_x, col_w = 0.025, 0.512, 0.463
+    fig.text(left_x, 0.845, "NEW GUIDANCE & CONSENSUS", fontsize=12,
+             weight="bold", color=teal)
+    fig.text(right_x, 0.845, "PIVOTAL TRIALS & META-ANALYSES", fontsize=12,
+             weight="bold", color=teal)
+
+    y = 0.826
+    for it in guide:
+        n = notes.get(it["pmid"], {})
+        soc = SOCIETY_RE.search(it.get("title", "") + " " +
+                                (it.get("abstract") or "")[:300])
+        body = n.get("what") or (it.get("abstract") or "")[:300]
+        h = card_height(body, n.get("impact", ""))
+        if y - h < 0.070:
+            fig.text(left_x, y - 0.028, f"+{len(guide) - guide.index(it)} "
+                     f"more guidance item(s) listed in the email",
+                     fontsize=9, color=grey, style="italic")
+            break
+        y -= card(left_x, y, col_w, n.get("title") or it.get("title", ""),
+                  " · ".join(x for x in (
+                      soc.group(1) if soc else "", it.get("journal", ""),
+                      f"PMID {it['pmid']}") if x),
+                  body, n.get("impact", "")) + 0.014
+
+    y = 0.826
+    for it in study:
+        n = notes.get(it["pmid"], {})
+        body = n.get("what") or (it.get("abstract") or "")[:300]
+        h = card_height(body, n.get("impact", ""))
+        if y - h < 0.070:
+            fig.text(right_x, y - 0.028, f"+{len(study) - study.index(it)} "
+                     f"more studies listed in the email", fontsize=9,
+                     color=grey, style="italic")
+            break
+        y -= card(right_x, y, col_w, n.get("title") or it.get("title", ""),
+                  f"{it.get('journal', '')} · {it['kind']} · PMID {it['pmid']}",
+                  body, n.get("impact", "")) + 0.014
+
+    if rest:
+        also = "; ".join(f"{it.get('journal', '?')} PMID {it['pmid']}"
+                         for it in rest[:5])
+        fig.text(left_x, 0.052, "\n".join(wrap("Also in this window: " + also,
+                                               150)), fontsize=8.4, color=grey)
+    fig.text(left_x, 0.026,
+             "Screening aid only — read the full text before changing "
+             "practice. Every PMID links to PubMed in the email.",
+             fontsize=8.4, color=grey, style="italic")
+    fig.text(right_x, 0.026,
+             f"rendered locally {datetime.now():%Y-%m-%d %H:%M} "
+             f"(NotebookLM dashboard unavailable for this run)",
+             fontsize=8.4, color=grey, ha="left")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, f"gihep_poster_{datetime.now():%Y%m%d-%H%M}.png")
+    fig.savefig(out, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out
+
+
 # ── Infographic 2: NotebookLM dashboard ──────────────────────────────────────
+NLM_ARTIFACTS = int(os.environ.get("NLM_ARTIFACTS") or 3)
 NLM_MAX_SOURCES = int(os.environ.get("NLM_MAX_SOURCES") or 10)
 NLM_GUIDE_SOURCES = int(os.environ.get("NLM_GUIDE_SOURCES") or 6)
 NLM_STUDY_SOURCES = int(os.environ.get("NLM_STUDY_SOURCES") or 4)
@@ -897,19 +1056,24 @@ def _key_points(text: str, kind: str, n: int = 2, cap: int = 340) -> str:
     return " ".join(parts[:n])[:cap].strip()
 
 
-def gihep_notebook_sources(items: list, digest_text: str) -> list:
+def gihep_notebook_sources(items: list, digest_text: str,
+                           cap: int | None = None) -> list:
     """Compact, curated per-item source blocks (guidance before studies)."""
     notes = parse_digest_notes(digest_text)
     ordered = sorted(items, key=lambda x: KIND_ORDER.get(x["kind"], 9))
     # Balanced selection so the notebook feeds BOTH infographic sections:
     # without this the guidance-heavy window starves the trials section and the
     # artifact drops it entirely.
-    guide = [it for it in ordered
-             if it["kind"] in ("guideline", "consensus")][:NLM_GUIDE_SOURCES]
-    study = [it for it in ordered
-             if it["kind"] in ("trial", "meta-analysis", "systematic review")
-             ][:NLM_STUDY_SOURCES]
-    picked = (guide + study)[:NLM_MAX_SOURCES] or ordered[:NLM_MAX_SOURCES]
+    cap = cap or NLM_MAX_SOURCES
+    if len(ordered) <= cap:
+        picked = ordered          # a thematic dashboard keeps all its items
+    else:
+        guide = [it for it in ordered
+                 if it["kind"] in ("guideline", "consensus")][:NLM_GUIDE_SOURCES]
+        study = [it for it in ordered
+                 if it["kind"] in ("trial", "meta-analysis", "systematic review")
+                 ][:NLM_STUDY_SOURCES]
+        picked = (guide + study)[:cap] or ordered[:cap]
     out = []
     for it in picked:
         n = notes.get(it["pmid"], {})
@@ -942,72 +1106,111 @@ def gihep_notebook_sources(items: list, digest_text: str) -> list:
     return out
 
 
-def gihep_notebook_context(items: list, digest_text: str,
-                           date_range: str = "") -> str:
-    """Strict, low-garble instructions for the NotebookLM clinical dashboard."""
-    kinds: dict = {}
-    for it in items:
-        kinds[it["kind"]] = kinds.get(it["kind"], 0) + 1
-    singular = {"guideline": "guideline", "consensus": "consensus statement",
-                "trial": "trial", "meta-analysis": "meta-analysis",
-                "systematic review": "systematic review", "study": "study"}
-    plural = {"guideline": "guidelines", "consensus": "consensus statements",
-              "trial": "trials", "meta-analysis": "meta-analyses",
-              "systematic review": "systematic reviews", "study": "studies"}
-    counts = ", ".join(
-        f"{v} {(singular if v == 1 else plural).get(k, k + 's')}"
-        for k, v in sorted(kinds.items()))
-    header = (f"GI & Hepatology Weekly — {date_range} — {len(items)} "
-              f"items ({counts})")
-    return (
-        "Create ONE clinical infographic titled 'GI & Hepatology Weekly: "
-        "Guidelines, Consensus & Key Trials' summarising this week's "
-        "gastroenterology and hepatology evidence for hospital specialists.\n"
-        "Use ONLY the attached sources. Never invent, translate, abbreviate or "
-        "respell a society, journal, drug, disease or number. Copy names and "
-        "numbers exactly as written in the sources; if a value is not in the "
-        "sources, omit it.\n"
-        "HEADER STRIP: copy this line verbatim; do not paraphrase it and do "
-        "not compute your own date range: \"" + header + "\"\n"
-        "ALL THREE sections below are MANDATORY and must all appear; if space "
-        "is tight, shorten the wording, never drop a section or a card.\n"
-        "SECTION 1 'New guidance & consensus' — 6 cards, one small card per "
-        "guideline or consensus statement. Each card: issuing society plus "
-        "journal abbreviation on one line, the population in max 8 words, then "
-        "ONE recommendation line of max 14 words taken from that source's KEY "
-        "POINTS, then 'Do:' in max 10 words, and that source's PMID in small "
-        "grey text. Put remaining guidance items in ONE footer line, max 3 of "
-        "them, with their PMIDs: 'Also published: <society> (<journal>) PMID "
-        "<pmid>; <society> (<journal>) PMID <pmid>'.\n"
-        "SECTION 2 'Pivotal trials & meta-analyses' — 4 cards, one per study: "
-        "population (max 8 words), intervention vs comparator (max 12 words), "
-        "then the study's headline result copied from that source's RESULT "
-        "line WITH its numbers, then 'So what:' in max 10 words, and the "
-        "source's PMID in small grey text.\n"
-        "SECTION 3 'What changed this week' — exactly 3 bullets, max 12 words "
-        "each, derived from the sources above.\n"
-        "Do NOT show scores, ratings, rankings, star bars, GRADE letters, "
-        "p-values, 'statistically significant' claims, or any statistic that is "
-        "not present in the sources. Do NOT add a date range of your own. "
-        "Never print placeholder strings such as '[Omitted]', 'N/A', 'TBD' or "
-        "'not specified' — if a fact is missing, leave that line out "
-        "completely. Copy every digit, percentage, confidence interval and "
-        "acronym exactly as written; never round, recompute or restate a "
-        "number, and never invent a value for a visual.\n"
-        "Do NOT draw charts, bar meters, gauges, percentage rings or score "
-        "dial elements anywhere — this is a text-and-icons layout, and "
-        "re-plotting numbers is how transcription errors creep in.\n"
+LIVER_RE = re.compile(
+    r"\b(hepat|liver|cirrhos|hcc|hepatocellular|biliary|cholest|mash|masld|"
+    r"nafld|hbv|hcv|portal|varice|ascites|fibroscan|endoscop\w* varice)\b",
+    re.I)
+
+
+def plan_dashboards(items: list, max_c = None) -> list:
+    """Split the window into thematic dashboards.
+
+    One big artifact for the whole window forces the generator to cram, which
+    is exactly where garble and dropped sections come from. Narrow dashboards
+    let each one summarise deeply instead."""
+    guide = [it for it in items if it["kind"] in ("guideline", "consensus")]
+    study = [it for it in items
+             if it["kind"] in ("trial", "meta-analysis", "systematic review")]
+    plans = [
+        {"key": "guidance", "notebook": "Guidance & Consensus",
+         "caption": "New guidance & consensus — every recommendation in this "
+                    "window's guidelines and expert statements (Gemini "
+                    "NotebookLM)",
+         "items": guide[:10]},
+        {"key": "trials", "notebook": "Trials & Meta-analyses",
+         "caption": "Pivotal trials & meta-analyses — populations, comparators "
+                    "and the headline numbers (Gemini NotebookLM)",
+         "items": study[:8]},
+        {"key": "signals", "notebook": "Practice Signals",
+         "caption": "Practice signals across the week — what to change, what to "
+                    "verify, what to watch (Gemini NotebookLM)",
+         "items": (guide[:5] + study[:4]
+                   + [it for it in items if it not in guide + study][:3]),
+         "cap": 12},
+    ]
+    return [pl for pl in plans if pl["items"]]
+
+
+def dashboard_context(plan: dict, digest_text: str, date_range: str,
+                      total_items: int) -> str:
+    """Deep, tightly-scoped instructions for one dashboard."""
+    head = (
+        "Create ONE clinical infographic titled 'GI & Hepatology Weekly — "
+        f"{plan['notebook']}' for hospital gastroenterologists and "
+        "hepatologists. Use ONLY the attached sources. Never invent, "
+        "translate, abbreviate or respell a society, journal, drug, disease or "
+        "number; copy names and numbers exactly as written, and if a value is "
+        "not in the sources omit it rather than guessing. Never print "
+        "placeholders ('[Omitted]', 'N/A', 'TBD'). Copy every digit, "
+        "percentage, confidence interval and acronym exactly; never round, "
+        "recompute or restate a number, and never invent a value for a visual. "
+        "Do NOT draw charts, bar meters, gauges or percentage rings — this is "
+        "a text-and-icons layout. Do NOT show scores, ratings, rankings, GRADE "
+        "letters or p-values of your own.\n"
+        "HEADER STRIP: copy this line verbatim: "
+        f"\"GI & Hepatology Weekly — {date_range} — {plan['notebook']} — "
+        f"{len(plan['items'])} of {total_items} items this window\"\n"
         "Style: clean clinical editorial; light background (#f7f9fb), navy "
         "#1e4e79 and teal #2e8b8b accents, red only for cautions; large legible "
-        "type (body equivalent to 18-20px), generous whitespace, thin light "
-        "borders, no dense paragraphs, max ~90 words per card, wide margins "
-        "so that NO text touches or is clipped by the image edge and nothing "
-        "overlaps the corner logo. Landscape poster layout, flat vector, no 3D "
-        "effects.\n\n"
-        "Attached source list (type, journal, date, PMID, title):\n"
-        + "\n".join(f"- {it['kind']} | {it.get('journal', '?')} | "
-                     f"{it.get('date', '')} | PMID {it['pmid']} | "
-                     f"{it.get('title', '')[:110]}" for it in items))
+        "type, generous whitespace, wide margins so NO text is clipped by the "
+        "image edge or overlaps the corner logo; landscape poster, flat "
+        "vector.\n\n")
+    if plan["key"] == "guidance":
+        body = (
+            "STRUCTURE — one card per source, 2 cards per row:\n"
+            "• card header: issuing society (exactly as named) + journal "
+            "abbreviation + PMID in small grey text\n"
+            "• 'Applies to:' the population in max 10 words\n"
+            "• 3 recommendation bullets of max 16 words each, taken from that "
+            "source's KEY POINTS — the concrete recommendations, not background\n"
+            "• 'Do:' one practice action in max 12 words\n"
+            "• if the source states a strength/certainty or a monitoring "
+            "interval, show it on its own line\n"
+            "After the cards add a short footer band: 'Overlaps & differences:' "
+            "one line naming any two sources that cover the same topic and how "
+            "they differ, or 'no overlapping guidance this week'.\n")
+    elif plan["key"] == "trials":
+        body = (
+            "STRUCTURE — one card per source, 2 cards per row:\n"
+            "• card header: journal + study design (e.g. RCT, meta-analysis) + "
+            "PMID\n"
+            "• 'Population:' max 12 words incl. N if given\n"
+            "• 'Intervention vs comparator:' max 14 words\n"
+            "• 'Result:' the headline result copied from that source's RESULT "
+            "line WITH its numbers (effect size, hazard/odds ratio with "
+            "confidence interval, absolute difference, event counts)\n"
+            "• 'So what:' the practice implication in max 12 words\n"
+            "• where the source states it, add one line on follow-up duration "
+            "or the key limitation\n"
+            "Do not rank or grade the studies; present them in the order given.\n")
+    else:
+        body = (
+            "STRUCTURE:\n"
+            "• 'What to change now' — up to 4 bulbs, each naming the society or "
+            "study and the concrete change, max 18 words\n"
+            "• 'Verify before acting' — up to 3 lines naming claims that need "
+            "the full text or are based on consensus/surrogate endpoints, max "
+            "16 words each\n"
+            "• 'Watch next' — 2 lines naming the questions this week's evidence "
+            "leaves open, max 16 words each\n"
+            "• 'Topic map' — a small grid of the week's themes (e.g. IBD, "
+            "hepatitis B, endoscopy quality, hepatobiliary oncology, "
+            "pancreatitis) with the journals that contributed, no numbers "
+            "beyond counts of items\n")
+    return head + body + "\nAttached source list:\n" + "\n".join(
+        f"- [{it['kind']}] {it.get('journal', '?')} {it.get('date', '')} "
+        f"PMID {it['pmid']} — {it.get('title', '')[:110]}"
+        for it in plan["items"])
 
 
 def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
@@ -1062,40 +1265,47 @@ def _nlm_latest_infographic_url(di, nb: str) -> str:
         return ""
 
 
-def make_notebooklm_infographic(items: list, digest_text: str,
-                               date_label: str, date_range: str = "") -> str:
-    """Generate + download the NotebookLM infographic. Returns path or ''."""
+def make_notebooklm_infographics(items: list, digest_text: str,
+                                 date_label: str,
+                                 date_range: str = "") -> list:
+    """Generate one deep NotebookLM dashboard per theme.
+
+    Returns [{'key','label','path'}] for every dashboard that rendered."""
     try:
         import digest_infographic as di
     except Exception as e:  # noqa: BLE001
         log(f"  NLM: digest_infographic import failed: {e}")
-        return ""
-    title = f"GI & Hepatology Weekly - {date_label}"
-    try:
-        nb = di.nlm_ensure_notebook(title)
-        srcs = gihep_notebook_sources(items, digest_text)
-        added = di.nlm_add_text_sources(nb, srcs)
-        guides = sum(1 for i in items
-                     if i["kind"] in ("guideline", "consensus"))
-        log(f"  NLM notebook {nb}: {added}/{len(srcs)} sources attached "
-            f"({sum(1 for s2 in srcs if 'RESULT:' in s2['text'])} study cards, "
-            f"{len(items)} items in window, {guides} guidance)")
-        url = _nlm_generate(di, nb,
-                            gihep_notebook_context(items, digest_text,
-                                                   date_range))
-        if not url:
-            url = _nlm_latest_infographic_url(di, nb)
-        if not url:
-            log("  NLM: no artifact url returned")
-            return ""
-        out = os.path.join(OUT_DIR,
-                          f"gihep_nlm_{datetime.now():%Y%m%d-%H%M}.png")
-        di.nlm_download_image(url, out)
-        log(f"  NLM infographic downloaded: {out}")
-        return out
-    except Exception as e:  # noqa: BLE001
-        log(f"  NLM infographic failed: {type(e).__name__}: {str(e)[:220]}")
-        return ""
+        return []
+    plans = plan_dashboards(items)[:max(1, NLM_ARTIFACTS)]
+    out_list = []
+    for plan in plans:
+        title = (f"GI & Hepatology Weekly - {plan['notebook']} - {date_label}")
+        try:
+            nb = di.nlm_ensure_notebook(title)
+            srcs = gihep_notebook_sources(plan["items"], digest_text,
+                                          cap=plan.get("cap"))
+            added = di.nlm_add_text_sources(nb, srcs)
+            studies = sum(1 for x in srcs if "RESULT:" in x["text"])
+            log(f"  NLM [{plan['key']}] notebook {nb}: {added}/{len(srcs)} "
+                f"sources attached ({studies} with RESULT lines)")
+            url = _nlm_generate(di, nb, dashboard_context(
+                plan, digest_text, date_range, len(items)))
+            if not url:
+                url = _nlm_latest_infographic_url(di, nb)
+            if not url:
+                log(f"  NLM [{plan['key']}]: no artifact url returned")
+                continue
+            out = os.path.join(
+                OUT_DIR,
+                f"gihep_nlm_{plan['key']}_{datetime.now():%Y%m%d-%H%M}.png")
+            di.nlm_download_image(url, out)
+            log(f"  NLM [{plan['key']}] downloaded: {out}")
+            out_list.append({"key": plan["key"], "label": plan["caption"],
+                             "path": out})
+        except Exception as e:  # noqa: BLE001
+            log(f"  NLM [{plan['key']}] failed: {type(e).__name__}: "
+                f"{str(e)[:200]}")
+    return out_list
 
 
 # ── Email ────────────────────────────────────────────────────────────────────
@@ -1244,11 +1454,9 @@ CSS = """
 
 def render_email(date_label: str, digest_text: str, items: list[dict],
                  also_indexed: list[dict], cids: list[str],
-                 meta_note: str) -> str:
-    labels = ["Evidence mix this week (rendered from the digest data: type, "
-              "journal and issuing-body counts)",
-              "Comprehensive clinical infographic generated by Gemini "
-              "NotebookLM from the attached item sources"]
+                 meta_note: str, labels: list | None = None) -> str:
+    labels = labels or ["Evidence mix this week (rendered from the digest "
+                        "data: type, journal and issuing-body counts)"]
     info = ""
     if cids:
         info = "<h4>At a glance</h4>"
@@ -1391,23 +1599,38 @@ def main() -> int:
         return 2
 
     meta_note = ", ".join(sorted({b for b in analysis["backends"] if b}))
-    chart = nlm_img = ""
+    chart = ""
     try:
         chart = render_evidence_chart(todo, OUT_DIR)
         log(f"matplotlib chart: {chart}")
     except Exception as e:  # noqa: BLE001
         log(f"ERROR chart render: {type(e).__name__}: {e}")
     date_range = f"{start:%Y-%m-%d} to {end:%Y-%m-%d}"
-    nlm_img = make_notebooklm_infographic(todo, analysis["text"],
-                                          date_label, date_range)
-    if not nlm_img:
-        meta_note = (meta_note + "; NotebookLM infographic unavailable this "
-                     "run — text summary + evidence-mix chart only")
+    dashboards = make_notebooklm_infographics(todo, analysis["text"],
+                                             date_label, date_range)
+    labels = ["Evidence mix this week (rendered from the digest data: type, "
+              "journal and issuing-body counts)"]
+    if not dashboards:
+        try:
+            poster = render_clinical_poster(todo, analysis["text"],
+                                            date_range, OUT_DIR)
+            dashboards = [{"key": "poster", "path": poster,
+                           "label": "Clinical summary poster rendered locally "
+                                    "(NotebookLM dashboards unavailable this "
+                                    "run)"}]
+            log(f"poster fallback rendered: {poster}")
+            meta_note = (meta_note + "; NotebookLM dashboards unavailable — "
+                         "locally rendered clinical poster instead")
+        except Exception as e:  # noqa: BLE001
+            log(f"ERROR poster fallback: {type(e).__name__}: {e}")
+            meta_note = meta_note + "; no summary infographic this run"
+    labels += [d["label"] for d in dashboards]
 
-    imgs = [p for p in (chart, nlm_img) if p]
+    dash_paths = [d["path"] for d in dashboards]
+    imgs = [p for p in ([chart] + dash_paths) if p]
     cids = [f"infographic{i}" for i in range(len(imgs))]
     body = render_email(date_label, analysis["text"], todo, dropped, cids,
-                        meta_note)
+                        meta_note, labels)
     subj = (f"GI & Hepatology Weekly — {len(todo)} item(s) "
             f"(guidelines, consensus & trials) {date_label}")
     status = send_email(subj, body, imgs, cids)
