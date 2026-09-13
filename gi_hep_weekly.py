@@ -822,6 +822,8 @@ def render_evidence_chart(items: list[dict], out_dir: str) -> str:
 
 # ── Infographic 2: NotebookLM dashboard ──────────────────────────────────────
 NLM_MAX_SOURCES = int(os.environ.get("NLM_MAX_SOURCES") or 10)
+NLM_GUIDE_SOURCES = int(os.environ.get("NLM_GUIDE_SOURCES") or 6)
+NLM_STUDY_SOURCES = int(os.environ.get("NLM_STUDY_SOURCES") or 4)
 # p-value handling: drop standalone "(p = 0.03)" groups first, then loose
 # "..., p = 0.03" tokens, so the surrounding sentence keeps its brackets.
 PVAL_GROUP_RE = re.compile(r"\(\s*p\s*[=<>]\s*0?\.\d+\s*\)", re.I)
@@ -881,8 +883,17 @@ def parse_digest_notes(digest_text: str) -> dict:
     return out
 
 
-def _first_sentences(text: str, n: int = 2, cap: int = 300) -> str:
-    parts = re.split(r"(?<=[.;])\s+", (text or "").strip())
+NUM_RE = re.compile(r"\d|\bCI\b|\bHR\b|\bOR\b|\bRR\b|\bNNT\b|\bvs\b|%")
+
+
+def _key_points(text: str, kind: str, n: int = 2, cap: int = 340) -> str:
+    """Two sentences of substance; for studies prefer sentences carrying the
+    headline numbers, otherwise the trial cards come out result-less."""
+    parts = [p for p in re.split(r"(?<=[.;])\s+", (text or "").strip()) if p]
+    if kind in ("trial", "meta-analysis", "systematic review"):
+        numbered = [p for p in parts if NUM_RE.search(p)]
+        parts = (numbered[:n] + [p for p in parts if p not in numbered])[:n] \
+            if numbered else parts[:n]
     return " ".join(parts[:n])[:cap].strip()
 
 
@@ -890,8 +901,17 @@ def gihep_notebook_sources(items: list, digest_text: str) -> list:
     """Compact, curated per-item source blocks (guidance before studies)."""
     notes = parse_digest_notes(digest_text)
     ordered = sorted(items, key=lambda x: KIND_ORDER.get(x["kind"], 9))
+    # Balanced selection so the notebook feeds BOTH infographic sections:
+    # without this the guidance-heavy window starves the trials section and the
+    # artifact drops it entirely.
+    guide = [it for it in ordered
+             if it["kind"] in ("guideline", "consensus")][:NLM_GUIDE_SOURCES]
+    study = [it for it in ordered
+             if it["kind"] in ("trial", "meta-analysis", "systematic review")
+             ][:NLM_STUDY_SOURCES]
+    picked = (guide + study)[:NLM_MAX_SOURCES] or ordered[:NLM_MAX_SOURCES]
     out = []
-    for it in ordered[:NLM_MAX_SOURCES]:
+    for it in picked:
         n = notes.get(it["pmid"], {})
         soc = SOCIETY_RE.search(it.get("title", "") + " " +
                                 (it.get("abstract") or "")[:300])
@@ -904,7 +924,11 @@ def gihep_notebook_sources(items: list, digest_text: str) -> list:
             f"TITLE: {n.get('title') or it.get('title', '')}",
         ]
         if n.get("what"):
-            lines.append("KEY POINTS: " + _first_sentences(n["what"], 2, 320))
+            kp = _key_points(n["what"], it["kind"])
+            label = ("RESULT" if it["kind"] in ("trial", "meta-analysis",
+                                               "systematic review")
+                     else "KEY POINTS")
+            lines.append(f"{label}: {kp}")
         if n.get("impact"):
             lines.append("PRACTICE: " + n["impact"][:220])
         if n.get("caveat"):
@@ -947,22 +971,32 @@ def gihep_notebook_context(items: list, digest_text: str,
         "not compute your own date range: \"" + header + "\"\n"
         "ALL THREE sections below are MANDATORY and must all appear; if space "
         "is tight, shorten the wording, never drop a section or a card.\n"
-        "SECTION 1 'New guidance & consensus' — 5 cards, one small card per "
+        "SECTION 1 'New guidance & consensus' — 6 cards, one small card per "
         "guideline or consensus statement. Each card: issuing society plus "
         "journal abbreviation on one line, the population in max 8 words, then "
         "ONE recommendation line of max 14 words taken from that source's KEY "
-        "POINTS, then 'Do:' in max 10 words. Put the remaining guidance items "
-        "in ONE footer line, max 3 of them: 'Also published: <society> "
-        "(<journal>); <society> (<journal>); <society> (<journal>)'.\n"
+        "POINTS, then 'Do:' in max 10 words, and that source's PMID in small "
+        "grey text. Put remaining guidance items in ONE footer line, max 3 of "
+        "them, with their PMIDs: 'Also published: <society> (<journal>) PMID "
+        "<pmid>; <society> (<journal>) PMID <pmid>'.\n"
         "SECTION 2 'Pivotal trials & meta-analyses' — 4 cards, one per study: "
         "population (max 8 words), intervention vs comparator (max 12 words), "
-        "then the study's headline result WITH the number exactly as given in "
-        "that source, then 'So what:' in max 10 words.\n"
+        "then the study's headline result copied from that source's RESULT "
+        "line WITH its numbers, then 'So what:' in max 10 words, and the "
+        "source's PMID in small grey text.\n"
         "SECTION 3 'What changed this week' — exactly 3 bullets, max 12 words "
         "each, derived from the sources above.\n"
         "Do NOT show scores, ratings, rankings, star bars, GRADE letters, "
         "p-values, 'statistically significant' claims, or any statistic that is "
-        "not present in the sources. Do NOT add a date range of your own.\n"
+        "not present in the sources. Do NOT add a date range of your own. "
+        "Never print placeholder strings such as '[Omitted]', 'N/A', 'TBD' or "
+        "'not specified' — if a fact is missing, leave that line out "
+        "completely. Copy every digit, percentage, confidence interval and "
+        "acronym exactly as written; never round, recompute or restate a "
+        "number, and never invent a value for a visual.\n"
+        "Do NOT draw charts, bar meters, gauges, percentage rings or score "
+        "dial elements anywhere — this is a text-and-icons layout, and "
+        "re-plotting numbers is how transcription errors creep in.\n"
         "Style: clean clinical editorial; light background (#f7f9fb), navy "
         "#1e4e79 and teal #2e8b8b accents, red only for cautions; large legible "
         "type (body equivalent to 18-20px), generous whitespace, thin light "
@@ -1006,7 +1040,11 @@ def make_notebooklm_infographic(items: list, digest_text: str,
         nb = di.nlm_ensure_notebook(title)
         srcs = gihep_notebook_sources(items, digest_text)
         added = di.nlm_add_text_sources(nb, srcs)
-        log(f"  NLM notebook {nb}: {added}/{len(srcs)} sources attached")
+        guides = sum(1 for i in items
+                     if i["kind"] in ("guideline", "consensus"))
+        log(f"  NLM notebook {nb}: {added}/{len(srcs)} sources attached "
+            f"({sum(1 for s2 in srcs if 'RESULT:' in s2['text'])} study cards, "
+            f"{len(items)} items in window, {guides} guidance)")
         url = di.nlm_generate_infographic(
             nb, gihep_notebook_context(items, digest_text, date_range))
         if not url:
