@@ -1010,6 +1010,41 @@ def gihep_notebook_context(items: list, digest_text: str,
                      f"{it.get('title', '')[:110]}" for it in items))
 
 
+def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
+    """Generate a fresh artifact; fall back to the newest completed one.
+
+    The vendored helper reuses today's artifact BEFORE generating, which is
+    right for a daily digest but silently serves a stale image when the prompt
+    or the sources just changed. Generate first here, and only fall back when
+    the notebook's daily artifact cap is hit or the call errors.
+    """
+    for attempt in (1, 2):
+        try:
+            d = di._nlm(["art", "generate", "infographic", instructions,
+                         "--wait", "-n", nb], timeout=timeout)
+            url = d.get("url", "")
+            if url:
+                return url
+            break
+        except RuntimeError as e:
+            msg = str(e)
+            low = msg.lower()
+            if "ratelimit" in low or "rate limit" in low:
+                log("  NLM: daily artifact cap reached — reusing the latest "
+                    "completed infographic")
+                return _nlm_latest_infographic_url(di, nb)
+            if attempt == 1 and ("authentication" in low
+                                 or "unexpected_error" in low):
+                try:
+                    di._nlm(["auth", "init"], timeout=180)
+                except Exception:
+                    pass
+                continue
+            log(f"  NLM generate error: {msg[:180]}")
+            break
+    return _nlm_latest_infographic_url(di, nb)
+
+
 def _nlm_latest_infographic_url(di, nb: str) -> str:
     """Fallback: newest completed Infographic in the notebook — covers both the
     daily artifact cap and a --wait that returns without a url."""
@@ -1045,8 +1080,9 @@ def make_notebooklm_infographic(items: list, digest_text: str,
         log(f"  NLM notebook {nb}: {added}/{len(srcs)} sources attached "
             f"({sum(1 for s2 in srcs if 'RESULT:' in s2['text'])} study cards, "
             f"{len(items)} items in window, {guides} guidance)")
-        url = di.nlm_generate_infographic(
-            nb, gihep_notebook_context(items, digest_text, date_range))
+        url = _nlm_generate(di, nb,
+                            gihep_notebook_context(items, digest_text,
+                                                   date_range))
         if not url:
             url = _nlm_latest_infographic_url(di, nb)
         if not url:
