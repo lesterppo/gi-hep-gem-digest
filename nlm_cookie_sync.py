@@ -114,8 +114,10 @@ def main() -> int:
         log(f"{os.path.basename(os.path.dirname(path))}: {len(cookies)} cookie(s)")
         if len(cookies) < 10:
             continue
+        backup = None
         if os.path.exists(STORAGE):
-            shutil.copy2(STORAGE, STORAGE + ".bak")
+            backup = STORAGE + ".good"
+            shutil.copy2(STORAGE, backup)
         os.makedirs(os.path.dirname(STORAGE), exist_ok=True)
         with open(STORAGE, "w") as f:
             json.dump({"cookies": cookies, "origins": []}, f)
@@ -137,10 +139,12 @@ def main() -> int:
                     rc |= p.returncode
                 return rc
             return 0
-        log("jar did not verify — trying next profile")
+        # A candidate jar that does not verify must never clobber a good local
+        # session (a broken jar breaks every NotebookLM call afterwards).
+        if backup:
+            shutil.copy2(backup, STORAGE)
+            log("jar did not verify — restored the previous session jar")
+        else:
+            log("jar did not verify (no previous jar to restore)")
     log("no usable NotebookLM jar found")
     return 2
-
-
-if __name__ == "__main__":
-    sys.exit(main())
