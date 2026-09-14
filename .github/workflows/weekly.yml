@@ -30,6 +30,11 @@ on:
         required: false
         default: ""
         type: string
+      nlm_artifacts:
+        description: "NotebookLM dashboards to generate (default 3, 0 = skip)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -98,6 +103,7 @@ jobs:
           ANALYSIS_MAX_ITEMS: ${{ github.event.inputs.max_items }}
           FETCH_SOURCE: ${{ github.event.inputs.fetch_source }}
           DIGEST_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          NLM_ARTIFACTS: ${{ github.event.inputs.nlm_artifacts }}
           SEEN_STATE_IGNORE: ${{ github.event.inputs.ignore_seen }}
         run: |
           if [ "$SEEN_STATE_IGNORE" = "1" ]; then rm -f state/seen_ids.json; fi
@@ -112,5 +118,6 @@ jobs:
             ~/.hermes/digest_images/
             /tmp/gihep_digest_email.html
             state/digest_b*.md
+            state/audit_*.json
           if-no-files-found: ignore
           retention-days: 7

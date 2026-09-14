@@ -210,7 +210,11 @@ def _queries() -> list[dict]:
     jour = _or_field("[jour]", GI_JOURNALS)
     genj = _or_field("[jour]", GEN_JOURNALS)
     mesh = _or_field("[MeSH]", GI_MESH)
-    mesh_major = _or_field("[MeSH Major Topic]", GI_MESH)
+    gi_tiab = ("(gastro*[tiab] OR hepat*[tiab] OR liver[tiab] OR bowel[tiab] "
+               "OR pancrea*[tiab] OR cirrhosis[tiab] OR endoscop*[tiab] "
+               "OR IBD[tiab] OR colitis[tiab] OR colorectal[tiab] "
+               "OR \"inflammatory bowel\"[tiab] OR reflux[tiab] "
+               "OR variceal[tiab])")
     guide = _or_field("[pt]", GUIDE_PUBTYPES)
     trial = _or_field("[pt]", TRIAL_PUBTYPES)
     title_guide = ("(" + " OR ".join(
@@ -231,10 +235,15 @@ def _queries() -> list[dict]:
         {"name": "trial_journal", "kind": "trial",
          "max": MAX_TRIAL_CANDIDATES,
          "term": f"({trial}) AND ({jour})"},
-        # Major general journals carrying GI-hepatology major-topic trials
+        # Major general journals carrying GI-hepatology trials. Relevance comes
+        # from title/abstract keywords, NOT MeSH: MeSH indexing lags weeks behind
+        # indexing, so a MeSH filter returns nothing in a weekly window. These
+        # appear sporadically, so this query uses a longer look-back (dedup keeps
+        # it from re-reporting).
         {"name": "trial_general", "kind": "trial",
          "max": max(6, MAX_TRIAL_CANDIDATES // 2),
-         "term": f"({trial}) AND ({genj}) AND ({mesh_major})"},
+         "reldate": max(WINDOW_DAYS, 30),
+         "term": f"({trial}) AND ({genj}) AND {gi_tiab}"},
     ]
 
 
@@ -327,12 +336,13 @@ def fetch_pubmed(start: datetime, end: datetime) -> tuple[list[dict], list[str]]
             params = urllib.parse.urlencode({
                 "db": "pubmed", "term": q["term"], "retmode": "json",
                 "retmax": q["max"], "datetype": "edat",
-                "reldate": WINDOW_DAYS, "sort": "pub_date"})
+                "reldate": q.get("reldate", WINDOW_DAYS), "sort": "pub_date"})
             d = json.loads(http_get(f"{EUTILS}esearch.fcgi?{params}").decode())
             res = d.get("esearchresult", {})
             ids = [i for i in res.get("idlist", []) if i]
             log(f"  {q['name']}: {res.get('count')} hit(s), "
-                f"{len(ids)} fetched (max {q['max']})")
+                f"{len(ids)} fetched (max {q['max']}, "
+                f"window {q.get('reldate', WINDOW_DAYS)}d)")
             if not ids:
                 continue
             xml = http_post(
@@ -368,6 +378,8 @@ def classify_kind(it: dict) -> str:
         return "meta-analysis"
     if "systematic review" in pts or "systematic review" in t:
         return "systematic review"
+    if "preclinical" in t and "randomi" not in pts and "trial" not in pts:
+        return "study"       # preclinical+phase 2a papers read as trials otherwise
     if "randomized controlled trial" in pts or "controlled clinical trial" in pts \
             or "clinical trial, phase" in pts:
         return "trial"
@@ -680,6 +692,9 @@ def build_prompt(items: list[dict], part: int, n_parts: int) -> str:
         "- Prefer concrete clinical language over generic praise; skip empty "
         "phrases like 'important study'.",
         "- No scores, no ratings, no rankings, no grade letters anywhere.",
+        "- Each PMID gets EXACTLY ONE block. Never write a second block for an "
+        "item already covered in this batch, and never restate an item with a "
+        "different journal or date.",
         "- Do not add a summary of your own at the end.",
     ]
     if LANG_LINE.get(DIGEST_LANG.lower()):
@@ -720,6 +735,66 @@ def analyze(items: list[dict]) -> dict:
             log(f"  batch {i} FAILED: {str(res.get('err'))[:200]}")
     return {"text": "\n\n".join(texts), "backends": backends,
             "errors": errors, "ok": bool(texts)}
+
+
+def dedupe_digest_blocks(digest_text: str) -> tuple:
+    """Drop repeated item blocks (the same PMID appearing twice).
+
+    Observed live: batch 1 returned two blocks for PMID 42674001, the second
+    citing a different journal. Deterministic safety net — the reader must not
+    see the same item twice, and the later copy is the unreliable one."""
+    text = digest_text or ""
+    starts = [m.start() for m in re.finditer(r"(?m)^###\s", text)]
+    if not starts:
+        return text, []
+    head = text[:starts[0]]
+    blocks = [text[starts[i]: starts[i + 1] if i + 1 < len(starts) else len(text)]
+              for i in range(len(starts))]
+    seen, kept, dropped = set(), [], []
+    for blk in blocks:
+        m = re.search(r"PMID\s+(\d{6,9})", blk)
+        pid = m.group(1) if m else ""
+        if pid and pid in seen:
+            dropped.append(pid)
+            continue
+        if pid:
+            seen.add(pid)
+        kept.append(blk)
+    if dropped:
+        log(f"  dedupe: dropped {len(dropped)} repeated item block(s): "
+            f"{', '.join(sorted(set(dropped)))}")
+    return head + "".join(kept), dropped
+
+
+def audit_digest(items: list, digest_text: str) -> dict:
+    """Trace every number the digest states back to its PubMed abstract.
+
+    A clinical digest that states a number its abstract does not contain is the
+    one failure mode that actually matters, so this runs on every CI run, logs
+    the finding and surfaces it in the email footer."""
+    try:
+        import digest_audit as da
+    except Exception as e:  # noqa: BLE001
+        log(f"  audit: import failed ({e}) — skipped")
+        return {"ran": False, "errors": [], "warnings": []}
+    try:
+        blocks = [b for b in da.parse_blocks(digest_text)
+                  if b["pmid"] in {it["pmid"] for it in items}]
+        src = da.fetch_abstracts([b["pmid"] for b in blocks])
+        findings = da.audit(blocks, src)
+        errs = [f for f in findings if f["level"] == "error"]
+        warns = [f for f in findings if f["level"] == "warn"]
+        log(f"  audit: {len(blocks)} block(s) traced to {len(src)} abstract(s) "
+            f"— {len(errs)} number error(s), {len(warns)} warning(s)")
+        for f in errs[:8]:
+            log(f"    AUDIT ERROR PMID {f['pmid']}: {f['issue']}")
+        for f in warns[:8]:
+            log(f"    AUDIT WARN  PMID {f['pmid']}: {f['issue']}")
+        return {"ran": True, "errors": errs, "warnings": warns,
+                "blocks": len(blocks), "sources": len(src)}
+    except Exception as e:  # noqa: BLE001
+        log(f"  audit: failed ({type(e).__name__}: {e}) — skipped")
+        return {"ran": False, "errors": [], "warnings": []}
 
 
 # ── Infographic 1: matplotlib evidence mix ───────────────────────────────────
@@ -1163,7 +1238,10 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
         "Before you finish, re-read every label and every number against the "
         "sources and correct any word that does not appear there — typical "
         "slips to check for: 'Caase' (should be 'Cease'), 'Non-clrrhotic', "
-        "'pancreatib', 'es vivo', 'Deducted', 'Al' (should be 'AI'). Never "
+        "'pancreatib', 'es vivo', 'Deducted', 'Al' (should be 'AI'), and "
+        "confidence levels (a 95% CI must never be printed as 98% CI). Keep the "
+        "source's direction wording too ('did not significantly improve' must "
+        "not become a bare 'not superior'). Never "
         "abbreviate a society or journal, never restate a confidence interval "
         "in the wrong order, and never invent a number to fill a field. The "
         "practice line of every card must start with exactly 'Do:' (never "
@@ -1294,7 +1372,10 @@ def make_notebooklm_infographics(items: list, digest_text: str,
     except Exception as e:  # noqa: BLE001
         log(f"  NLM: digest_infographic import failed: {e}")
         return []
-    plans = plan_dashboards(items)[:max(1, NLM_ARTIFACTS)]
+    if NLM_ARTIFACTS <= 0:
+        log("  NLM: dashboards disabled (NLM_ARTIFACTS=0)")
+        return []
+    plans = plan_dashboards(items)[:NLM_ARTIFACTS]
     out_list = []
     for plan in plans:
         title = (f"GI & Hepatology Weekly - {plan['notebook']} - {date_label}")
@@ -1306,8 +1387,13 @@ def make_notebooklm_infographics(items: list, digest_text: str,
             studies = sum(1 for x in srcs if "RESULT:" in x["text"])
             log(f"  NLM [{plan['key']}] notebook {nb}: {added}/{len(srcs)} "
                 f"sources attached ({studies} with RESULT lines)")
-            url = _nlm_generate(di, nb, dashboard_context(
-                plan, digest_text, date_range, len(items)))
+            instructions = dashboard_context(plan, digest_text, date_range,
+                                            len(items))
+            url = _nlm_generate(di, nb, instructions)
+            if not url:
+                log(f"  NLM [{plan['key']}]: retrying once after a short wait")
+                time.sleep(20)
+                url = _nlm_generate(di, nb, instructions)
             if not url:
                 url = _nlm_latest_infographic_url(di, nb)
             if not url:
@@ -1472,7 +1558,8 @@ CSS = """
 
 def render_email(date_label: str, digest_text: str, items: list[dict],
                  also_indexed: list[dict], cids: list[str],
-                 meta_note: str, labels: list | None = None) -> str:
+                 meta_note: str, labels: list | None = None,
+                 verification: dict | None = None) -> str:
     labels = labels or ["Evidence mix this week (rendered from the digest "
                         "data: type, journal and issuing-body counts)"]
     info = ""
@@ -1484,6 +1571,25 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
             if i < len(labels):
                 info += f"<div class='cap'>{labels[i]}</div>"
         info += "<hr/>"
+    verification = verification or {}
+    verify_html = ""
+    if verification.get("ran"):
+        n_err = len(verification.get("errors") or [])
+        n_blk = verification.get("blocks") or 0
+        n_src = verification.get("sources") or 0
+        if n_err == 0:
+            verify_html = (
+                f"<div class='banner'>Number check: every figure stated for "
+                f"{n_blk} item(s) was traced back to its PubMed abstract "
+                f"({n_src} abstracts checked) — no unmatched numbers.</div>")
+        else:
+            listed = "; ".join(f"PMID {f['pmid']}: {f['issue']}"
+                               for f in verification["errors"][:6])
+            verify_html = (
+                f"<div class='banner' style='border-left-color:#c0392b'>"
+                f"Number check: {n_err} figure(s) could NOT be traced to the "
+                f"source abstract — treat these as unverified: "
+                f"{_html.escape(listed)}</div>")
     src_rows = "".join(
         f"<tr><td>{it['kind']}</td><td>{(it.get('journal') or '?')}</td>"
         f"<td>{it.get('date','')}</td>"
@@ -1519,6 +1625,7 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
             f"<table><tr><th>Type</th><th>Journal</th><th>Date</th>"
             f"<th>PMID</th><th>Title</th></tr>{src_rows}</table>"
             f"{also}"
+            f"{verify_html}"
             f"<hr/><div class='meta'>Sources: PubMed E-utilities "
             f"(guideline/consensus publication types, GI-hepatology journals, "
             f"GI-hepatology MeSH topics), Europe PMC as fallback. "
@@ -1608,6 +1715,8 @@ def main() -> int:
         return 0
 
     analysis = analyze(todo)
+    analysis["text"], _dropped = dedupe_digest_blocks(analysis.get("text", ""))
+    verification = audit_digest(todo, analysis["text"])
     if not analysis["ok"]:
         detail = "\n".join(errors + analysis["errors"])
         log(f"Gemini analysis failed on every batch — WARN email. "
@@ -1648,7 +1757,7 @@ def main() -> int:
     imgs = [p for p in ([chart] + dash_paths) if p]
     cids = [f"infographic{i}" for i in range(len(imgs))]
     body = render_email(date_label, analysis["text"], todo, dropped, cids,
-                        meta_note, labels)
+                        meta_note, labels, verification)
     subj = (f"GI & Hepatology Weekly — {len(todo)} item(s) "
             f"(guidelines, consensus & trials) {date_label}")
     status = send_email(subj, body, imgs, cids)
