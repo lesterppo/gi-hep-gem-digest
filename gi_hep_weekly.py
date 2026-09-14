@@ -1051,8 +1051,11 @@ def _key_points(text: str, kind: str, n: int = 2, cap: int = 340) -> str:
     parts = [p for p in re.split(r"(?<=[.;])\s+", (text or "").strip()) if p]
     if kind in ("trial", "meta-analysis", "systematic review"):
         numbered = [p for p in parts if NUM_RE.search(p)]
-        parts = (numbered[:n] + [p for p in parts if p not in numbered])[:n] \
-            if numbered else parts[:n]
+        if numbered:
+            rest = [p for p in parts if p not in numbered]
+            parts = (numbered[:n] + rest)[:n]
+        else:
+            parts = parts[:n]
     return " ".join(parts[:n])[:cap].strip()
 
 
@@ -1088,7 +1091,7 @@ def gihep_notebook_sources(items: list, digest_text: str,
             f"TITLE: {n.get('title') or it.get('title', '')}",
         ]
         if n.get("what"):
-            kp = _key_points(n["what"], it["kind"])
+            kp = _key_points(n["what"], it["kind"], n=3)
             label = ("RESULT" if it["kind"] in ("trial", "meta-analysis",
                                                "systematic review")
                      else "KEY POINTS")
@@ -1157,6 +1160,14 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
         "Do NOT draw charts, bar meters, gauges or percentage rings — this is "
         "a text-and-icons layout. Do NOT show scores, ratings, rankings, GRADE "
         "letters or p-values of your own.\n"
+        "Before you finish, re-read every label and every number against the "
+        "sources and correct any word that does not appear there — typical "
+        "slips to check for: 'Caase' (should be 'Cease'), 'Non-clrrhotic', "
+        "'pancreatib', 'es vivo', 'Deducted', 'Al' (should be 'AI'). Never "
+        "abbreviate a society or journal, never restate a confidence interval "
+        "in the wrong order, and never invent a number to fill a field. The "
+        "practice line of every card must start with exactly 'Do:' (never "
+        "'Action:', 'Recommendation:' or 'Suggest:').\n"
         "HEADER STRIP: copy this line verbatim: "
         f"\"GI & Hepatology Weekly — {date_range} — {plan['notebook']} — "
         f"{len(plan['items'])} of {total_items} items this window\"\n"
@@ -1168,8 +1179,9 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
     if plan["key"] == "guidance":
         body = (
             "STRUCTURE — one card per source, 2 cards per row:\n"
-            "• card header: issuing society (exactly as named) + journal "
-            "abbreviation + PMID in small grey text\n"
+            "• card header line, in this exact order on one line: issuing "
+            "society (exactly as named; write 'Society not stated' if the "
+            "source names none) — journal abbreviation — PMID (small grey)\n"
             "• 'Applies to:' the population in max 10 words\n"
             "• 3 recommendation bullets of max 16 words each, taken from that "
             "source's KEY POINTS — the concrete recommendations, not background\n"
@@ -1177,8 +1189,10 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
             "• if the source states a strength/certainty or a monitoring "
             "interval, show it on its own line\n"
             "After the cards add a short footer band: 'Overlaps & differences:' "
-            "one line naming any two sources that cover the same topic and how "
-            "they differ, or 'no overlapping guidance this week'.\n")
+            "then ONE short sentence of max 18 words naming two sources that "
+            "cover the same topic and how they differ, or the seven words "
+            "'no overlapping guidance this week'. Keep it inside the card "
+            "grid — it must not run off the edge.\n")
     elif plan["key"] == "trials":
         body = (
             "STRUCTURE — one card per source, 2 cards per row:\n"
@@ -1188,7 +1202,9 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
             "• 'Intervention vs comparator:' max 14 words\n"
             "• 'Result:' the headline result copied from that source's RESULT "
             "line WITH its numbers (effect size, hazard/odds ratio with "
-            "confidence interval, absolute difference, event counts)\n"
+            "confidence interval, absolute difference, event counts). If that "
+            "source has no numbers, state the qualitative finding in max 14 "
+            "words; never invent figures and never alter an interval\n"
             "• 'So what:' the practice implication in max 12 words\n"
             "• where the source states it, add one line on follow-up duration "
             "or the key limitation\n"
