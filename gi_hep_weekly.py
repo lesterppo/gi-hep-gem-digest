@@ -1129,11 +1129,11 @@ def plan_dashboards(items: list, max_c = None) -> list:
          "caption": "New guidance & consensus — every recommendation in this "
                     "window's guidelines and expert statements (Gemini "
                     "NotebookLM)",
-         "items": guide[:10]},
+         "items": guide[:8]},
         {"key": "trials", "notebook": "Trials & Meta-analyses",
          "caption": "Pivotal trials & meta-analyses — populations, comparators "
                     "and the headline numbers (Gemini NotebookLM)",
-         "items": study[:8]},
+         "items": study[:6]},
         {"key": "signals", "notebook": "Practice Signals",
          "caption": "Practice signals across the week — what to change, what to "
                     "verify, what to watch (Gemini NotebookLM)",
