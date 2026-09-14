@@ -24,6 +24,11 @@ GitHub Actions (Mon 01:30 UTC)
   │     Citation · Type · What it says (effect sizes, no p-values) ·
   │     Practice impact · Caveat, preceded by "Week in focus" and
   │     "Guideline watch"
+  ├── Verification gate (every run):
+  │     • duplicate item blocks dropped (the model re-wrote an item with a
+  │       different journal on a live run)
+  │     • every figure stated is traced back to its PubMed abstract; the email
+  │       footer reports "no unmatched numbers" or names the unverified ones
   ├── Infographics:
   │     1. matplotlib evidence-mix chart (type / journal / issuing body counts)
   │     2. Gemini NotebookLM dashboard — "Guidance & consensus"
@@ -101,11 +106,34 @@ numbers and its practice implication.
 | `ABSTRACT_CHARS` | `1500` | Abstract characters sent per item |
 | `GEMINI_MODEL` / `GEMINI_THINKING` | `flash` / `extended` | Web backend |
 | `GEMINI_API_MODEL` | `gemini-3.5-flash` | API fallback (then flash-lite, 2.5-flash) |
-| `NLM_ARTIFACTS` | `3` | How many NotebookLM dashboards to generate (guidance / trials / signals) |
+| `NLM_ARTIFACTS` | `3` | How many NotebookLM dashboards to generate (guidance / trials / signals; `0` skips) |
+| `NLM_BUDGET` | `900` | Seconds for the whole infographic phase before remaining dashboards are skipped |
 | `FETCH_SOURCE` | `auto` | `pubmed` \| `epmc` pins the tier |
 | `DIGEST_LANG` | `en` | `zh-Hant` writes the report in Traditional Chinese |
 | `DIGEST_DRY_RUN` | *(unset)* | `1` = run everything, send nothing |
 | `SEEN_KEEP_DAYS` | `120` | Dedup-cache retention |
+
+## Verification
+
+`digest_audit.py` is not just a dev tool — it runs inside every CI run:
+
+```
+audit: 26 block(s) traced to 25 abstract(s) — 0 number error(s), 0 warning(s)
+```
+
+It re-fetches each item's PubMed record and checks that (a) no PMID gets two
+blocks, (b) every number, percentage, CI and confidence level the digest states
+appears in that item's abstract or title, (c) the block carries its What-it-says
+/ Practice-impact / Caveat lines, and (d) the cited journal matches PubMed. Run
+it by hand on any digest text:
+
+```bash
+python3 digest_audit.py state/digest_b1.md state/digest_b2.md
+```
+
+Why it exists: on a live run the model emitted the same item twice, the second
+copy citing the wrong journal, and nothing in the logs noticed. Numbers that
+cannot be traced are surfaced in the email rather than silently shipped.
 
 ## Files
 
@@ -115,6 +143,7 @@ numbers and its practice implication.
 | `digest_infographic.py` | NotebookLM helpers (notebook, sources, artifact, download) |
 | `nlm.py` | NotebookLM CLI wrapper |
 | `gemini.py`, `urllib_session.py` | Gemini CLI (gemini-webapi, cookie auth) |
+| `digest_audit.py` | Trace digest numbers back to PubMed abstracts (CI gate) |
 | `nlm_cookie_sync.py` | Refresh the NotebookLM session jar + push the secret |
 | `refresh_gh_secrets.py` | Push Gemini cookies to GitHub secrets |
 | `.github/workflows/weekly.yml` | The scheduled job |
@@ -160,6 +189,10 @@ numbers and its practice implication.
   input arrives as `''`.
 * **PubMed uses `datetype=edat&reldate=N`** (indexing date) — that is what
   "new this week" means.
+* **Never filter a recent window by MeSH.** MeSH terms are assigned weeks after
+  indexing, so `MeSH Major Topic` on the general-journal trial query returned 0
+  hits every week; it now uses title/abstract keywords with a longer (30-day)
+  look-back, and dedup stops it re-reporting the same study.
 * **Europe PMC syntax is not PubMed syntax** (`MESH:"…"`, `JOURNAL:"…"`,
   `PUB_TYPE:"…"`, `FIRST_PDATE:[a TO b]`); it is only the fallback tier because
   its full-text indexing lags PubMed by weeks.
