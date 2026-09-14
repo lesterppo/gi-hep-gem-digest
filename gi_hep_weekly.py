@@ -1309,6 +1309,9 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
         for it in plan["items"])
 
 
+NLM_BUDGET = int(os.environ.get("NLM_BUDGET") or 900)
+
+
 def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
     """Generate a fresh artifact; fall back to the newest completed one.
 
@@ -1344,6 +1347,35 @@ def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
     return _nlm_latest_infographic_url(di, nb)
 
 
+AUTH_DEAD_RE = re.compile(
+    r"authentication|401|403|expired|cookiemismatch|unauthenticated", re.I)
+
+
+def _nlm_add_sources(di, nb: str, srcs: list, deadline: float) -> int:
+    """Attach sources one by one, aborting on the first dead-session error.
+
+    The vendored batch helper keeps going after every failure, so a jar that
+    has already expired costs one 120s timeout PER SOURCE (eight sources = 16
+    minutes of a 30-minute job). Bail out on the first auth error instead."""
+    added = 0
+    for src in srcs:
+        if time.time() > deadline:
+            log("  NLM: source-attach budget exhausted")
+            break
+        try:
+            di._nlm(["src", "add", "--type", "text", "--title",
+                     src["title"][:90], src["text"], "-n", nb], timeout=90)
+            added += 1
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if AUTH_DEAD_RE.search(msg):
+                log(f"  NLM: session unusable while attaching sources "
+                    f"({msg[:90]}) — aborting this dashboard")
+                break
+            log(f"  NLM: source skip ({msg[:80]})")
+    return added
+
+
 def _nlm_latest_infographic_url(di, nb: str) -> str:
     """Fallback: newest completed Infographic in the notebook — covers both the
     daily artifact cap and a --wait that returns without a url."""
@@ -1377,23 +1409,40 @@ def make_notebooklm_infographics(items: list, digest_text: str,
         return []
     plans = plan_dashboards(items)[:NLM_ARTIFACTS]
     out_list = []
+    t0 = time.time()
     for plan in plans:
+        # Hard budget for the whole infographic phase: without it, three
+        # dashboards x 7-minute artifact timeouts (+ a retry each) can outlive
+        # the workflow's timeout-minutes and the run is killed before the email
+        # is ever sent. Whatever rendered by then is what the email carries.
+        spent = time.time() - t0
+        if spent > NLM_BUDGET:
+            log(f"  NLM [{plan['key']}]: skipped — infographic budget "
+                f"{NLM_BUDGET}s exhausted ({spent:.0f}s spent)")
+            continue
         title = (f"GI & Hepatology Weekly - {plan['notebook']} - {date_label}")
         try:
             nb = di.nlm_ensure_notebook(title)
             srcs = gihep_notebook_sources(plan["items"], digest_text,
                                           cap=plan.get("cap"))
-            added = di.nlm_add_text_sources(nb, srcs)
+            added = _nlm_add_sources(di, nb, srcs, t0 + NLM_BUDGET)
+            if added == 0:
+                log(f"  NLM [{plan['key']}]: no sources attached — skipping")
+                continue
             studies = sum(1 for x in srcs if "RESULT:" in x["text"])
             log(f"  NLM [{plan['key']}] notebook {nb}: {added}/{len(srcs)} "
                 f"sources attached ({studies} with RESULT lines)")
             instructions = dashboard_context(plan, digest_text, date_range,
                                             len(items))
-            url = _nlm_generate(di, nb, instructions)
-            if not url:
-                log(f"  NLM [{plan['key']}]: retrying once after a short wait")
-                time.sleep(20)
-                url = _nlm_generate(di, nb, instructions)
+            remaining = max(120, NLM_BUDGET - int(time.time() - t0))
+            url = _nlm_generate(di, nb, instructions,
+                                timeout=min(420, remaining))
+            if not url and remaining > 240:
+                log(f"  NLM [{plan['key']}]: retrying once "
+                    f"({remaining}s budget left)")
+                time.sleep(15)
+                url = _nlm_generate(di, nb, instructions,
+                                    timeout=min(420, remaining - 60))
             if not url:
                 url = _nlm_latest_infographic_url(di, nb)
             if not url:
