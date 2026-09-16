@@ -57,6 +57,33 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Preflight — required repository secrets
+        # Public repo: a forker must supply their own secrets, and a missing one
+        # must fail HERE with a clear message instead of surfacing mid-run as a
+        # misleading auth error (or silently producing no digest).
+        # Only secret NAMES are ever printed — never values.
+        env:
+          GEMINI_SID: ${{ secrets.GEMINI_SID }}
+          GEMINI_TS: ${{ secrets.GEMINI_TS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RECIPIENT: ${{ secrets.RECIPIENT }}
+          NLM_STORAGE_STATE_GZ: ${{ secrets.NLM_STORAGE_STATE_GZ }}
+        run: |
+          missing=""
+          for v in GEMINI_SID GEMINI_TS GEMINI_API_KEY SMTP_USER SMTP_PASS RECIPIENT; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing required repository secret(s):$missing — add them under Settings → Secrets and variables → Actions (see README 'Secrets')."
+            exit 1
+          fi
+          echo "required secrets present: GEMINI_SID GEMINI_TS GEMINI_API_KEY SMTP_USER SMTP_PASS RECIPIENT (values never printed)"
+          if [ -z "$NLM_STORAGE_STATE_GZ" ]; then
+            echo "::warning::NLM_STORAGE_STATE_GZ not set — NotebookLM dashboards will be skipped (the matplotlib evidence-mix chart and the locally rendered poster still ship)"
+          fi
+
       - name: Setup Gemini auth (env cookies -> auth.json)
         env:
           GEMINI_SID: ${{ secrets.GEMINI_SID }}
