@@ -154,9 +154,15 @@ def audit(blocks: list, src: dict) -> list:
                 findings.append({"pmid": b["pmid"], "level": "error",
                                  "issue": f"number '{t}' (core {num}) in "
                                           f"What-it-says is NOT in the abstract"})
-        # confidence levels must not be invented/altered
+        # confidence levels must not be invented/altered. Normalize phrasing
+        # variants first: abstracts write "95% confidence interval(s)",
+        # "95%CI", "95 % CI" as often as the canonical "95% CI" (live 09-21:
+        # 4 of 6 flags were this false positive on real CIs).
+        ab_ci = re.sub(r"confidence intervals?", "CI", ab, flags=re.I)
+        ab_ci = re.sub(r"(\d)\s+%", r"\1%", ab_ci)
+        ab_ci = re.sub(r"%\s*CI\b", "% CI", ab_ci)
         for cl in CI_RE.findall(b["raw"]):
-            if f"{cl}% CI" not in ab and f"{cl} % CI" not in ab:
+            if f"{cl}% CI" not in ab_ci:
                 findings.append({"pmid": b["pmid"], "level": "error",
                                  "issue": f"'{cl}% CI' does not appear in the "
                                           f"abstract"})

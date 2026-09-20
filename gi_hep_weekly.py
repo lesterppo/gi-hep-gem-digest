@@ -644,23 +644,26 @@ def build_prompt(items: list[dict], part: int, n_parts: int) -> str:
     ]
     if n_parts > 1 and part == 1:
         head.append(
-            "Start with the '## Week in focus' and '## Guideline watch' "
-            "sections, then the item blocks.")
+            "Start with the '## Week in focus' section, then the item blocks.")
     elif n_parts > 1:
         head.append("Output ONLY the item blocks (no week-in-focus section).")
     else:
         head.append(
-            "Start with '## Week in focus', then '## Guideline watch', then "
-            "the item blocks.")
+            "Start with '## Week in focus', then the item blocks.")
     head += [
         "",
         "## Week in focus",
         "- 3-5 bullets: the developments that would most change practice this "
-        "week. Each bullet names the issuing body or journal and the PMID.",
+        "week. Each bullet MUST name the issuing body or journal and the PMID, "
+        "state the finding in max 25 words, and end with exactly 'Why it "
+        "matters: <practice change in max 20 words>'. Shape: "
+        "- {issuing body/journal, PMID}: {finding, max 25 words}. "
+        "Why it matters: {practice change, max 20 words}.",
         "",
         "## Guideline watch",
-        "- one line naming the societies/bodies that issued new or updated "
-        "guidance this week, or the single word: none",
+        "- Do NOT write a Guideline watch section yourself — it is built "
+        "deterministically from the items (society regex + titles) at render "
+        "time, so just continue straight to the item blocks.",
         "",
         "Then one block per item, EXACTLY this shape:",
         "",
@@ -696,6 +699,12 @@ def build_prompt(items: list[dict], part: int, n_parts: int) -> str:
         "item already covered in this batch, and never restate an item with a "
         "different journal or date.",
         "- Do not add a summary of your own at the end.",
+        "- If the abstract does not state N, the primary-endpoint effect size "
+        "(HR/OR/RR), or its 95% CI, write 'endpoint/N not stated in abstract "
+        "\u2014 verify full text' inside the relevant line. NEVER complete numbers "
+        "from prior knowledge, from the discussion section you remember, or "
+        "from a similar trial. An abstract that omits the primary endpoint "
+        "numbers is itself a finding \u2014 report the omission.",
     ]
     if LANG_LINE.get(DIGEST_LANG.lower()):
         head.append("- " + LANG_LINE[DIGEST_LANG.lower()])
@@ -797,6 +806,40 @@ def audit_digest(items: list, digest_text: str) -> dict:
         return {"ran": False, "errors": [], "warnings": []}
 
 
+AUDIT_BADGE = "\u26a0 numbers need verification (see footer)"
+
+
+def apply_audit_badges(digest_text: str, verification: dict | None) -> str:
+    """Prepend the inline warning badge to the Caveat line of every block
+    with an error-level audit finding (matched by PMID).
+
+    Flagged blocks are never dropped — the reader sees what was claimed plus
+    the flag, with the detail in the footer."""
+    errs = (verification or {}).get("errors") or []
+    pmids = {str(f.get("pmid", "")) for f in errs if f.get("pmid")}
+    if not pmids or not digest_text or AUDIT_BADGE in digest_text:
+        return digest_text
+    parts = re.split(r"(?m)(?=^###\s)", digest_text)
+    out = []
+    flagged = 0
+    for p in parts:
+        if not p.startswith("###"):
+            out.append(p)  # head matter (e.g. Week in focus) — never badged
+            continue
+        m = re.search(r"PMID\s+(\d{6,9})", p)
+        if m and m.group(1) in pmids and AUDIT_BADGE not in p:
+            p2, n = re.subn(r"(\*\*Caveat\*\*:\s*)",
+                            r"\1" + AUDIT_BADGE + " \u2014 ", p, count=1)
+            if n == 0:
+                p2 = p.rstrip() + f"\n- **Caveat**: {AUDIT_BADGE}.\n"
+            p = p2
+            flagged += 1
+        out.append(p)
+    if flagged:
+        log(f"  audit: flagged {flagged} block(s) with inline badges")
+    return "".join(out)
+
+
 # ── Infographic 1: matplotlib evidence mix ───────────────────────────────────
 def _trunc(s: str, n: int) -> str:
     """Truncate a label with an ellipsis so clipping is never ambiguous."""
@@ -852,18 +895,24 @@ def render_evidence_chart(items: list[dict], out_dir: str) -> str:
     ax.set_xlim(0, max(vals) * 1.22)
     ax.set_title("Evidence type mix", fontsize=11, color="#1e4e79",
                  fontweight="bold", loc="left")
+    from matplotlib.patches import Patch as _Patch
+    ax.legend(handles=[_Patch(facecolor="#1e4e79", label="guidance/consensus"),
+                       _Patch(facecolor="#2e8b8b", label="trials/studies")],
+              fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.08),
+              ncol=2, frameon=True, facecolor="white", edgecolor="#e3e8ee")
     ax.set_xticks([])
 
     ax = axes[1]
     ax.barh(range(len(jtop)), [c for _, c in jtop], color="#7aa6c2",
             height=0.62)
     ax.set_yticks(range(len(jtop)))
-    ax.set_yticklabels([_trunc(j, 24) for j, _ in jtop], fontsize=8)
+    ax.set_yticklabels([_trunc(j, 30) for j, _ in jtop], fontsize=8)
     for i, (_, c) in enumerate(jtop):
         ax.text(c + 0.06, i, str(c), va="center", fontsize=8,
                 color="#33414f", fontweight="bold")
     ax.set_xlim(0, max(c for _, c in jtop) * 1.25)
-    ax.set_title("Journals represented", fontsize=11, color="#1e4e79",
+    _jsub = "top 8" if len(jtop) == 8 else f"all {len(jtop)}"
+    ax.set_title(f"Journals represented ({_jsub})", fontsize=11, color="#1e4e79",
                  fontweight="bold", loc="left")
     ax.set_xticks([])
 
@@ -886,7 +935,7 @@ def render_evidence_chart(items: list[dict], out_dir: str) -> str:
     win = (f"Window: last {WINDOW_DAYS} days  |  {len(items)} items analysed  |"
            f"  generated {datetime.now():%Y-%m-%d %H:%M}")
     fig.text(0.02, 0.015, win, fontsize=8.5, color="#5b6b7c", ha="left")
-    fig.subplots_adjust(left=0.24, right=0.98, top=0.86, bottom=0.09,
+    fig.subplots_adjust(left=0.28, right=0.98, top=0.86, bottom=0.15,
                         wspace=0.55)
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, f"gihep_chart_{datetime.now():%Y%m%d-%H%M}.png")
@@ -1605,40 +1654,185 @@ CSS = """
 </style>"""
 
 
+# ── v2 email structure: guideline table, card split, cross-dash note ──────
+XDASH_NOTE = ("同一PMID可能同時出現在兩個儀表板，但視角不同（建議內容 vs "
+              "試驗結果 vs 實踐信號），並非重複收錄。")
+FULL_CARD_CAP = 12
+
+
+def _strip_guideline_watch(head_md: str) -> str:
+    """Drop any LLM-written Guideline watch section from the digest head.
+
+    The delivered table is built deterministically from the analysed items
+    (society regex + titles), so a model-written list would only disagree
+    with it."""
+    out, skip = [], False
+    for ln in (head_md or "").splitlines():
+        if re.match(r"##\s+Guideline watch", ln, re.I):
+            skip = True
+            continue
+        if skip and re.match(r"##\s+\S", ln):
+            skip = False
+        if not skip:
+            out.append(ln)
+    return "\n".join(out).strip()
+
+
+def _guideline_watch_table(items: list[dict]) -> str:
+    """Deterministic Issuing body|Topic|PMID table (no LLM)."""
+    trs = []
+    for it in items or []:
+        if (it.get("kind") or "") not in ("guideline", "consensus"):
+            continue
+        m = SOCIETY_RE.search((it.get("title") or "") + " "
+                              + ((it.get("abstract") or "")[:400]))
+        soc = m.group(1) if m else "not stated"
+        topic = re.sub(r"\s+", " ",
+                       (it.get("title") or "untitled")).strip()[:110]
+        trs.append(
+            f"<tr><td>{_html.escape(soc)}</td>"
+            f"<td>{_html.escape(topic)}</td>"
+            f"<td><a href='https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/'>"
+            f"{it['pmid']}</a></td></tr>")
+    body = ("<tr><td colspan='3'>none (no new guidance this week)</td></tr>"
+            if not trs else "".join(trs))
+    return ("<h4>Guideline watch</h4><table><tr><th>Issuing body</th>"
+            "<th>Topic</th><th>PMID</th></tr>" + body + "</table>")
+
+
+def _one_line(text: str, n: int = 20) -> str:
+    """First sentence, capped at n words, for the compact table."""
+    s = re.split(r"(?<=[.;])\s+", (text or "").strip())
+    first = s[0] if s and s[0] else (text or "").strip()
+    w = first.split()
+    return " ".join(w[:n]) + ("…" if len(w) > n else "")
+
+
+def _synth_block(it: dict) -> str:
+    """Fallback full-card markdown for an item the model never blocked."""
+    ab = re.sub(r"\s+", " ", (it.get("abstract") or "")).strip()
+    return (
+        f"### {(it.get('title') or 'untitled')[:90]}\n"
+        f"- **Citation**: {it.get('journal', '?')} - {it.get('date', '')} - "
+        f"PMID {it['pmid']} (https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/)\n"
+        f"- **Type**: {it.get('kind', 'study')}\n"
+        f"- **What it says**: "
+        f"{(ab[:300] if ab else 'not summarised — verify full text')}\n"
+        f"- **Practice impact**: see abstract — verify full text\n"
+        f"- **Caveat**: "
+        f"{'abstract truncated - verify full text' if not ab else 'not summarised — verify full text'}"
+    )
+
+
+def _split_digest_for_email(items: list[dict], digest_text: str,
+                            force_full: set | None = None) -> tuple:
+    """Split the analysed digest into (head_md, full_cards, compact_rows).
+
+    Full cards ONLY for guidelines/consensus and trials-with-numbers
+    (capped at FULL_CARD_CAP); everything else ('no change', truncated
+    abstracts with no numbers, editorials/corrigenda) goes to the compact
+    'Also in this window' table. PMIDs in force_full (audit-flagged blocks)
+    always get full cards — a flagged block must stay visible with its flag.
+    Item order is kept throughout — placement is by actionability (guidance
+    first), never by score."""
+    text = digest_text or ""
+    m = re.search(r"(?m)^###\s", text)
+    head_md = _strip_guideline_watch(text[:m.start()] if m else text)
+    blocks: dict[str, str] = {}
+    if m:
+        for b in re.split(r"\n(?=###\s)", text[m.start():]):
+            pm = re.search(r"PMID\s+(\d{6,9})", b)
+            if pm and pm.group(1) not in blocks:
+                blocks[pm.group(1)] = b.strip()
+    notes = parse_digest_notes(text)
+    full: list = []
+    compact: list = []
+    forced: list = []
+    force_full = force_full or set()
+    for it in items or []:
+        pmid = it["pmid"]
+        n = notes.get(pmid, {})
+        kind = it.get("kind") or ""
+        probe = n.get("what") or (it.get("abstract") or "")
+        if pmid in force_full:
+            forced.append((it, blocks.get(pmid) or _synth_block(it)))
+        elif kind in ("guideline", "consensus"):
+            full.append((it, blocks.get(pmid) or _synth_block(it)))
+        elif kind in ("trial", "meta-analysis", "systematic review") \
+                and NUM_RE.search(probe):
+            full.append((it, blocks.get(pmid) or _synth_block(it)))
+        else:
+            compact.append((it, blocks.get(pmid), n))
+    overflow = full[FULL_CARD_CAP:]
+    full = full[:FULL_CARD_CAP]
+    for it, blk in overflow:
+        compact.append((it, blk, notes.get(it["pmid"], {})))
+    full.extend(forced)  # audit-flagged: always visible, exempt from the cap
+    for pmid, blk in blocks.items():
+        if pmid not in {it["pmid"] for it in items or []}:
+            full.append((None, blk))  # delivered but unmatched — keep visible
+    return head_md, full, compact
+
+
 def render_email(date_label: str, digest_text: str, items: list[dict],
                  also_indexed: list[dict], cids: list[str],
                  meta_note: str, labels: list | None = None,
-                 verification: dict | None = None) -> str:
+                 verification: dict | None = None,
+                 nlm_note: bool = False, chart_led: bool = True) -> str:
     labels = labels or ["Evidence mix this week (rendered from the digest "
                         "data: type, journal and issuing-body counts)"]
-    info = ""
+    head_md, full_cards, compact_rows = _split_digest_for_email(
+        items, digest_text,
+        force_full={str(f.get("pmid", ""))
+                    for f in (verification or {}).get("errors", []) or []
+                    if f.get("pmid")})
+    guide_table = _guideline_watch_table(items)
+    chart_html, dash_html = "", ""
     if cids:
-        info = "<h4>At a glance</h4>"
-        for i, cid in enumerate(cids):
-            info += (f"<img class='infographic' src='cid:{cid}' "
-                     f"alt='digest infographic {i+1}'/>")
-            if i < len(labels):
-                info += f"<div class='cap'>{labels[i]}</div>"
-        info += "<hr/>"
+        rest_cids = list(cids)
+        rest_labels = list(labels)
+        if chart_led:
+            chart_html = ("<img class='infographic' src='cid:" + cids[0]
+                          + "' alt='evidence mix chart'/>")
+            if labels:
+                chart_html += f"<div class='cap'>{labels[0]}</div>"
+            rest_cids, rest_labels = list(cids[1:]), list(labels[1:])
+        if rest_cids:
+            parts = []
+            if nlm_note:
+                parts.append(f"<div class='banner'>{XDASH_NOTE}</div>")
+            for i, cid in enumerate(rest_cids):
+                parts.append(
+                    f"<img class='infographic' src='cid:{cid}' "
+                    f"alt='digest infographic {i+1}'/>")
+                if i < len(rest_labels):
+                    parts.append(f"<div class='cap'>{rest_labels[i]}</div>")
+            dash_html = "".join(parts) + "<hr/>"
     verification = verification or {}
     verify_html = ""
     if verification.get("ran"):
         n_err = len(verification.get("errors") or [])
+        n_warn = len(verification.get("warnings") or [])
         n_blk = verification.get("blocks") or 0
         n_src = verification.get("sources") or 0
+        audit_line = (f"audit: {n_blk} blocks traced — {n_err} errors, "
+                      f"{n_warn} warnings")
         if n_err == 0:
             verify_html = (
-                f"<div class='banner'>Number check: every figure stated for "
-                f"{n_blk} item(s) was traced back to its PubMed abstract "
-                f"({n_src} abstracts checked) — no unmatched numbers.</div>")
+                f"<div class='banner'>{audit_line}. Number check: every "
+                f"figure stated for {n_blk} item(s) was traced back to its "
+                f"PubMed abstract ({n_src} abstracts checked) — no unmatched "
+                f"numbers.</div>")
         else:
-            listed = "; ".join(f"PMID {f['pmid']}: {f['issue']}"
-                               for f in verification["errors"][:6])
+            listed = "; ".join(
+                f"<a href='https://pubmed.ncbi.nlm.nih.gov/{f['pmid']}/'>"
+                f"PMID {f['pmid']}</a>: {_html.escape(str(f['issue']))}"
+                for f in verification["errors"][:8])
             verify_html = (
                 f"<div class='banner' style='border-left-color:#c0392b'>"
-                f"Number check: {n_err} figure(s) could NOT be traced to the "
-                f"source abstract — treat these as unverified: "
-                f"{_html.escape(listed)}</div>")
+                f"{audit_line}. Number check: {n_err} figure(s) could NOT be "
+                f"traced to the source abstract — treat these as unverified "
+                f"(flagged \u26a0 inline): {listed}</div>")
     src_rows = "".join(
         f"<tr><td>{it['kind']}</td><td>{(it.get('journal') or '?')}</td>"
         f"<td>{it.get('date','')}</td>"
@@ -1656,30 +1850,57 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
             for it in also_indexed[:BREAKING_LIMIT])
         also = (f"<h4>Also indexed this week (not analysed)</h4>"
                 f"<ul class='also'>{rows}</ul>")
+    full_md = "\n\n".join(blk for _, blk in full_cards).strip()
+    full_html = (f"<h4>Practice-changing cards</h4>{md_to_htmlish(full_md)}"
+                 if full_md else "")
+    compact_html = ""
+    if compact_rows:
+        trs = []
+        for it, _blk, n in compact_rows:
+            typ = n.get("type") or it.get("kind", "")
+            finding = _one_line(n.get("what") or (it.get("abstract") or ""))
+            title = re.sub(r"\s+", " ", (n.get("title")
+                                         or it.get("title")
+                                         or "untitled")).strip()[:110]
+            trs.append(
+                f"<tr><td><a href='https://pubmed.ncbi.nlm.nih.gov/"
+                f"{it['pmid']}/'>{_html.escape(title)}</a></td>"
+                f"<td>{_html.escape(typ)}</td>"
+                f"<td>{_html.escape(finding)}</td></tr>")
+        compact_html = (
+            "<h4>Also in this window</h4><table><tr><th>Title</th><th>Type</th>"
+            "<th>Finding (\u226420 words)</th></tr>" + "".join(trs)
+            + "</table>")
     return (f"<html><head><meta charset='utf-8'>{CSS}</head><body>"
-            f"<h1>GI &amp; Hepatology Weekly</h1>"
-            f"<div class='meta'>Guidelines, consensus statements and clinical "
-            f"studies newly indexed in PubMed. Generated {date_label} by "
-            f"Gemini Flash + Extended Thinking"
+            + f"<h1>GI &amp; Hepatology Weekly</h1>"
+            + f"<div class='meta'>Guidelines, consensus statements and clinical "
+            + f"studies newly indexed in PubMed. Generated {date_label} by "
+            + f"Gemini Flash + Extended Thinking"
             + (f" ({_html.escape(meta_note)})" if meta_note else "")
             + f". Window: last {WINDOW_DAYS} days. "
-            f"{len(items)} item(s) analysed.</div>"
-            f"<div class='banner'>Ranking-free digest: every new guideline, "
-            f"consensus statement, randomised trial and meta-analysis in "
-            f"gastroenterology &amp; hepatology for this window is summarised "
-            f"with its numbers and its practice implication.</div>"
-            f"<hr/>{info}"
-            f"{md_to_htmlish(digest_text)}"
-            f"<hr/><h4>Items analysed this week</h4>"
-            f"<table><tr><th>Type</th><th>Journal</th><th>Date</th>"
-            f"<th>PMID</th><th>Title</th></tr>{src_rows}</table>"
-            f"{also}"
-            f"{verify_html}"
-            f"<hr/><div class='meta'>Sources: PubMed E-utilities "
-            f"(guideline/consensus publication types, GI-hepatology journals, "
-            f"GI-hepatology MeSH topics), Europe PMC as fallback. "
-            f"Automated summary — verify full texts before changing practice."
-            f"</div></body></html>")
+            + f"{len(items)} item(s) analysed.</div>"
+            + f"<div class='banner'>Ranking-free digest: every new guideline, "
+            + f"consensus statement, randomised trial and meta-analysis in "
+            + f"gastroenterology &amp; hepatology for this window is summarised "
+            + f"with its numbers and its practice implication. Placement is by "
+            + f"actionability, not by score.</div>"
+            + f"<hr/>{md_to_htmlish(head_md)}"
+            + f"<hr/>{guide_table}"
+            + (f"<hr/><h4>Evidence mix</h4>{chart_html}" if chart_html else "")
+            + (f"<hr/>{full_html}" if full_html else "")
+            + (f"<hr/>{compact_html}" if compact_html else "")
+            + (f"<hr/>{dash_html}" if dash_html else "")
+            + f"<hr/><h4>Items analysed this week</h4>"
+            + f"<table><tr><th>Type</th><th>Journal</th><th>Date</th>"
+            + f"<th>PMID</th><th>Title</th></tr>{src_rows}</table>"
+            + f"{also}"
+            + f"{verify_html}"
+            + f"<hr/><div class='meta'>Sources: PubMed E-utilities "
+            + f"(guideline/consensus publication types, GI-hepatology journals, "
+            + f"GI-hepatology MeSH topics), Europe PMC as fallback. "
+            + f"Automated summary — verify full texts before changing practice. "
+            + f"Run ID: {_html.escape(str(date_label))}."
+            + f"</div></body></html>")
 
 
 def render_warn_email(date_label: str, detail: str) -> str:
@@ -1766,6 +1987,7 @@ def main() -> int:
     analysis = analyze(todo)
     analysis["text"], _dropped = dedupe_digest_blocks(analysis.get("text", ""))
     verification = audit_digest(todo, analysis["text"])
+    analysis["text"] = apply_audit_badges(analysis["text"], verification)
     if not analysis["ok"]:
         detail = "\n".join(errors + analysis["errors"])
         log(f"Gemini analysis failed on every batch — WARN email. "
@@ -1805,8 +2027,11 @@ def main() -> int:
     dash_paths = [d["path"] for d in dashboards]
     imgs = [p for p in ([chart] + dash_paths) if p]
     cids = [f"infographic{i}" for i in range(len(imgs))]
+    img_labels = labels if chart else labels[1:]
+    nlm_note = any(d.get("key") != "poster" for d in dashboards)
     body = render_email(date_label, analysis["text"], todo, dropped, cids,
-                        meta_note, labels, verification)
+                        meta_note, img_labels, verification,
+                        nlm_note=nlm_note, chart_led=bool(chart))
     subj = (f"GI & Hepatology Weekly — {len(todo)} item(s) "
             f"(guidelines, consensus & trials) {date_label}")
     status = send_email(subj, body, imgs, cids)

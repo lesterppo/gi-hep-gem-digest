@@ -142,9 +142,17 @@ jobs:
         with:
           name: gihep-digest-output
           path: |
-            ~/.hermes/digest_images/
+            ~/.hermes/digest_images/gihep_chart_*.png
+            ~/.hermes/digest_images/gihep_nlm_*.png
+            ~/.hermes/digest_images/gihep_poster_*.png
             /tmp/gihep_digest_email.html
             state/digest_b*.md
             state/audit_*.json
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Alert on audit errors
+        if: always()
+        run: |
+          grep -a "AUDIT ERROR" "$HOME/.hermes/digest_images/gihep_*.log" 2>/dev/null \
+            && echo "::warning::digest_audit reported number errors — see inline ⚠ badges" || true
