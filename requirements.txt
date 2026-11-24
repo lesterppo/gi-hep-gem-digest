@@ -1,9 +1,14 @@
 # GI & Hepatology Weekly digest — GitHub Actions runner deps.
 # gemini.py uses gemini-webapi (cookie auth) + curl_cffi; stdlib elsewhere.
 # matplotlib renders the evidence-mix chart locally (no API needed).
-gemini-webapi>=2.0.0
-curl_cffi>=0.7.0
-loguru
-browser-cookie3
-matplotlib>=3.8
-notebooklm-py>=0.8.1
+#
+# Versions are PINNED (==): upstream API churn is frequent (the repo's own
+# nlm.py v5/v6/v7 changelogs document it), and an unpinned major bump can
+# break the run. Pins are the versions the 2026-11-24 dry run verified green
+# after the review pass; bump one at a time and re-run a dry run.
+gemini-webapi==2.1.1
+curl_cffi==0.17.0
+loguru==0.8.0
+browser-cookie3==0.20.1
+matplotlib==3.11.2
+notebooklm-py==0.8.6
