@@ -46,15 +46,20 @@ from email.mime.text import MIMEText
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "state", "seen_ids.json")
+ARCHIVE_DIR = os.path.join(SCRIPT_DIR, "archive")
 OUT_DIR = os.environ.get("DIGEST_OUT_DIR",
                          os.path.expanduser("~/.hermes/digest_images"))
+# Global run deadline (seconds from run start) for the infographic phase:
+# the email is the last step, so NotebookLM must stop well before the
+# workflow timeout (45 min) or the run dies with no email at all.
+RUN_DEADLINE_S = int(os.environ.get("RUN_DEADLINE_S") or 1500)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 WINDOW_DAYS = int(os.environ.get("RUN_BACK_DAYS") or 14)
 MAX_GUIDE_CANDIDATES = int(os.environ.get("MAX_GUIDE_CANDIDATES") or 25)
 MAX_TRIAL_CANDIDATES = int(os.environ.get("MAX_TRIAL_CANDIDATES") or 15)
 ANALYSIS_MAX_ITEMS = int(os.environ.get("ANALYSIS_MAX_ITEMS") or 34)
-ABSTRACT_CHARS = int(os.environ.get("ABSTRACT_CHARS") or 1500)
+ABSTRACT_CHARS = int(os.environ.get("ABSTRACT_CHARS") or 2500)
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE") or 18)
 SEEN_KEEP_DAYS = int(os.environ.get("SEEN_KEEP_DAYS") or 120)
 BREAKING_LIMIT = int(os.environ.get("BREAKING_LIMIT") or 10)
@@ -66,9 +71,13 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "extended")
 GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT") or 300)
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES") or 2)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# API fallback ladder. gemini-3.5-flash is deprecated on the Developer API
+# (requests are silently routed to 3.6-flash since Oct 2026), so the ladder
+# leads with the current 3.8-flash; 2.5-flash stays as the last resort.
 GEMINI_API_MODELS = [
-    m for m in (os.environ.get("GEMINI_API_MODEL", "gemini-3.5-flash"),
-                "gemini-flash-lite-latest", "gemini-2.5-flash") if m]
+    m for m in (os.environ.get("GEMINI_API_MODEL", "gemini-3.8-flash"),
+                "gemini-3.6-flash", "gemini-flash-lite-latest",
+                "gemini-2.5-flash") if m]
 DIGEST_LANG = os.environ.get("DIGEST_LANG", "en").strip() or "en"
 FETCH_SOURCE = (os.environ.get("FETCH_SOURCE") or "auto").strip().lower()
 
@@ -95,10 +104,13 @@ GI_JOURNALS = [
     "Eur J Gastroenterol Hepatol", "HPB (Oxford)", "Pancreatology",
     "J Clin Gastroenterol", "BMC Gastroenterol", "Ann Hepatol",
     "World J Gastroenterol", "Clin Transl Gastroenterol", "Hepatol Commun",
+    "J Viral Hepat", "Dig Dis Sci", "Cell Mol Gastroenterol Hepatol",
+    "Hepatol Res",
 ]
 GEN_JOURNALS = [
     "N Engl J Med", "Lancet", "Lancet Gastroenterol Hepatol", "JAMA",
     "Nat Med", "Ann Intern Med", "Nat Rev Gastroenterol Hepatol", "BMJ",
+    "eClinicalMedicine", "JAMA Netw Open", "Nature", "Science",
 ]
 GI_MESH = [
     "Gastrointestinal Diseases", "Liver Diseases",
@@ -114,10 +126,45 @@ GUIDE_PUBTYPES = ["guideline", "practice guideline",
 TRIAL_PUBTYPES = ["randomized controlled trial", "meta-analysis",
                   "systematic review", "clinical trial, phase iii",
                   "controlled clinical trial", "clinical trial, phase ii"]
-TITLE_GUIDE_RE = re.compile(
-    r"\b(guideline|guidance|consensus|position statement|recommendation|"
-    r"recommendations|delphi|expert review|clinical practice update|"
-    r"white paper|standards of practice)\b", re.I)
+RETRACTION_PUBTYPES = ["retraction of publication", "published erratum"]
+# Journal -> issuing society fallback for the Guideline watch table: the
+# society is often inferable from the journal when the title/abstract
+# never names it.
+JOURNAL_SOCIETY = {
+    "Am J Gastroenterol": "ACG",
+    "Clin Gastroenterol Hepatol": "AGA",
+    "Gastroenterology": "AGA",
+    "Gut": "BSG",
+    "J Hepatol": "EASL",
+    "Hepatology": "AASLD",
+    "Endoscopy": "ESGE",
+    "Gastrointest Endosc": "ASGE",
+    "J Crohns Colitis": "ECCO",
+    "Hepatol Int": "APASL",
+    "Clin Mol Hepatol": "KASL",
+    "J Gastroenterol": "JSGE",
+    "Dig Endosc": "JSGE",
+    "Liver Int": "EASL",
+}
+# Asia-Pacific relevance: Asia-Pacific journals, or a title/abstract that
+# names the region, a country, or a regional society.
+ASIA_PACIFIC_JOURNALS = {
+    "J Gastroenterol Hepatol", "Hepatol Int", "Clin Mol Hepatol",
+    "Dig Endosc", "J Gastroenterol",
+}
+ASIA_RE = re.compile(
+    r"\b(Hong Kong|China|Chinese|Japan|Japanese|Korea|Korean|Taiwan|"
+    r"Singapore|Asia-Pacific|Asia Pacific|APAGE|APASL|JSGE|JSH|KASL)\b", re.I)
+
+
+def _asia_tag(it: dict) -> str:
+    """'Asia-Pacific' when the item is recognisably Asia-Pacific, else ''."""
+    if (it.get("journal") or "") in ASIA_PACIFIC_JOURNALS:
+        return "Asia-Pacific"
+    hay = (it.get("title") or "") + " " + (it.get("abstract") or "")[:600]
+    return "Asia-Pacific" if ASIA_RE.search(hay) else ""
+
+
 SOCIETY_RE = re.compile(
     r"\b(ESGE|ESGAR|EASL|AASLD|ACG|AGA|ASGE|BSG|APAGE|ESMO|ECCO|ESPGHAN|"
     r"NASPGHAN|WGO|UEG|EASD|AISF|AISP|JSGE|JSH|KASL|KLCA|CSCO|NICE|"
@@ -214,9 +261,14 @@ def _queries() -> list[dict]:
                "OR pancrea*[tiab] OR cirrhosis[tiab] OR endoscop*[tiab] "
                "OR IBD[tiab] OR colitis[tiab] OR colorectal[tiab] "
                "OR \"inflammatory bowel\"[tiab] OR reflux[tiab] "
-               "OR variceal[tiab])")
+               "OR variceal[tiab] OR esophag*[tiab] OR oesophag*[tiab] "
+               "OR gastric[tiab] OR stomach[tiab] OR duodenal[tiab] "
+               "OR biliary[tiab] OR cholangio*[tiab] OR MASH[tiab] "
+               "OR MASLD[tiab] OR NAFLD[tiab] OR \"fatty liver\"[tiab] "
+               "OR gallbladder[tiab] OR \"small bowel\"[tiab])")
     guide = _or_field("[pt]", GUIDE_PUBTYPES)
     trial = _or_field("[pt]", TRIAL_PUBTYPES)
+    retract = _or_field("[pt]", RETRACTION_PUBTYPES)
     title_guide = ("(" + " OR ".join(
         f'"{t}"[ti]' for t in ("guideline", "guidelines", "consensus",
                               "recommendations", "position statement",
@@ -244,6 +296,21 @@ def _queries() -> list[dict]:
          "max": max(6, MAX_TRIAL_CANDIDATES // 2),
          "reldate": max(WINDOW_DAYS, 30),
          "term": f"({trial}) AND ({genj}) AND {gi_tiab}"},
+        # Guidelines / consensus in the major general journals. Same MeSH-lag
+        # problem as trial_general: a guideline indexed 3 days ago has no MeSH
+        # yet, so guide_topic misses it and guide_journal never sees it (not a
+        # GI journal). Title words + keywords + 30-day look-back, as trials do.
+        {"name": "guide_general", "kind": "guideline",
+         "max": 7,
+         "reldate": max(WINDOW_DAYS, 30),
+         "term": f"(({guide}) OR ({title_guide})) AND ({genj}) AND {gi_tiab}"},
+        # Corrections & retractions in the GI journals: a trial covered in an
+        # earlier digest that is later retracted must be flagged to the reader.
+        # These are NOT analysed — they are listed as a box in the email.
+        {"name": "retraction", "kind": "retraction",
+         "max": 5,
+         "reldate": max(WINDOW_DAYS, 30),
+         "term": f"({retract}) AND ({jour})"},
     ]
 
 
@@ -333,14 +400,35 @@ def fetch_pubmed(start: datetime, end: datetime) -> tuple[list[dict], list[str]]
     by_pmid: dict[str, dict] = {}
     for q in _queries():
         try:
-            params = urllib.parse.urlencode({
+            base = {
                 "db": "pubmed", "term": q["term"], "retmode": "json",
                 "retmax": q["max"], "datetype": "edat",
-                "reldate": q.get("reldate", WINDOW_DAYS), "sort": "pub_date"})
-            d = json.loads(http_get(f"{EUTILS}esearch.fcgi?{params}").decode())
+                "reldate": q.get("reldate", WINDOW_DAYS), "sort": "pub_date"}
+            d = json.loads(http_get(
+                f"{EUTILS}esearch.fcgi?{urllib.parse.urlencode(base)}"
+            ).decode())
             res = d.get("esearchresult", {})
+            total = int(res.get("count") or 0)
             ids = [i for i in res.get("idlist", []) if i]
-            log(f"  {q['name']}: {res.get('count')} hit(s), "
+            # Page past the per-query cap: esearch returns the most recent
+            # first, so a truncated query PERMANENTLY misses the older hits
+            # (the seen-cache never records what was never fetched). Cap the
+            # paging at 100 per query; selection still caps what is analysed.
+            start = len(ids)
+            while total > len(ids) and len(ids) < 100:
+                page = dict(base, retstart=start,
+                            retmax=min(q["max"], 100 - len(ids)))
+                d2 = json.loads(http_get(
+                    f"{EUTILS}esearch.fcgi?{urllib.parse.urlencode(page)}"
+                ).decode())
+                more = [i for i in
+                        d2.get("esearchresult", {}).get("idlist", []) if i]
+                if not more:
+                    break
+                ids += more
+                start += len(more)
+                time.sleep(0.4)
+            log(f"  {q['name']}: {total} hit(s), "
                 f"{len(ids)} fetched (max {q['max']}, "
                 f"window {q.get('reldate', WINDOW_DAYS)}d)")
             if not ids:
@@ -352,7 +440,10 @@ def fetch_pubmed(start: datetime, end: datetime) -> tuple[list[dict], list[str]]
                     "retmode": "xml", "rettype": "abstract"}).encode(),
                 "application/x-www-form-urlencoded", timeout=90)
             for it in parse_pubmed_xml(xml):
-                it["kind"] = classify_kind(it)
+                # Retractions keep their own kind: classify_kind would call
+                # most of them "study" and they would be analysed as trials.
+                it["kind"] = ("retraction" if q["name"] == "retraction"
+                              else classify_kind(it))
                 it["query"] = q["name"]
                 if it["pmid"] not in by_pmid:
                     by_pmid[it["pmid"]] = it
@@ -419,8 +510,11 @@ def fetch_epmc(start: datetime, end: datetime) -> tuple[list[dict], list[str]]:
             rows = d.get("resultList", {}).get("result", [])
             log(f"  epmc {name}: {d.get('hitCount')} hit(s), {len(rows)} fetched")
             for r in rows:
-                pmid = str(r.get("pmid") or r.get("id") or "").strip()
-                if not pmid:
+                # PMID only: for a non-MEDLINE record `id` is a PMCID-style
+                # string, and storing it as a "pmid" would produce a broken
+                # PubMed link in the email.
+                pmid = str(r.get("pmid") or "").strip()
+                if not pmid or not pmid.isdigit():
                     continue
                 ji = (r.get("journalInfo") or {})
                 jrec = (ji.get("journal") or {})
@@ -457,7 +551,16 @@ def _load_seen() -> dict:
         with open(STATE_FILE, encoding="utf-8") as f:
             d = json.load(f)
         return d if isinstance(d, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        # A corrupt cache must not silently reset dedup (the whole window
+        # would re-report as new). Keep the evidence and start clean.
+        log("  WARNING: seen-cache is corrupt — backing it up and resetting")
+        try:
+            os.replace(STATE_FILE, STATE_FILE + ".corrupt")
+        except OSError:
+            pass
         return {}
 
 
@@ -477,15 +580,55 @@ KIND_ORDER = {"guideline": 0, "consensus": 1, "meta-analysis": 2,
               "systematic review": 3, "trial": 4, "study": 5}
 
 
+TRIAL_KINDS = ("trial", "meta-analysis", "systematic review")
+MIN_TRIAL_SLOTS = int(os.environ.get("MIN_TRIAL_SLOTS") or 8)
+
+
 def select_items(items: list[dict], seen: dict) -> tuple[list[dict], list[dict], list[dict]]:
-    """Split into (to_analyse, already_seen, dropped_for_capacity)."""
+    """Split into (to_analyse, already_seen, dropped_for_capacity).
+
+    Kind-first (guidance before studies), newest first inside each kind
+    group — but with a floor for trials: in a guideline-heavy week the
+    kind-first sort can fill every slot and push out every trial, so at
+    least MIN_TRIAL_SLOTS slots go to trials/meta-analyses/reviews when
+    any were dropped. The swap sacrifices the lowest-priority kept items
+    first ('study' items, then the oldest guidance) while protecting at
+    least 6 guideline/consensus slots."""
     fresh = [it for it in items if it["pmid"] not in seen]
     dupes = [it for it in items if it["pmid"] in seen]
-    # guidance before studies; newest first inside each kind group
     fresh.sort(key=lambda x: (KIND_ORDER.get(x["kind"], 9),
                               _neg_date(x.get("date") or "")))
     kept = fresh[:ANALYSIS_MAX_ITEMS]
     dropped = fresh[ANALYSIS_MAX_ITEMS:]
+    n_trial = sum(1 for it in kept if it.get("kind") in TRIAL_KINDS)
+    if n_trial < MIN_TRIAL_SLOTS:
+        dropped_trials = [it for it in dropped
+                          if it.get("kind") in TRIAL_KINDS]
+        for tr in dropped_trials:
+            if n_trial >= MIN_TRIAL_SLOTS:
+                break
+            n_guide = sum(1 for it in kept
+                          if it.get("kind") in ("guideline", "consensus"))
+            # Lowest-priority swap candidate: the oldest kept 'study' item,
+            # else the oldest kept guideline/consensus beyond the 6-slot
+            # floor. (kept is kind-first, newest-first within kind, so the
+            # last item of a kind group is its oldest.)
+            cands = [i for i, it in enumerate(kept)
+                     if it.get("kind") == "study"]
+            if not cands and n_guide > 6:
+                cands = [i for i, it in enumerate(kept)
+                         if it.get("kind") in ("guideline", "consensus")]
+            swap = cands[-1] if cands else None
+            if swap is None:
+                break
+            dropped.append(kept[swap])
+            kept[swap] = tr
+            dropped.remove(tr)
+            n_trial += 1
+        kept.sort(key=lambda x: (KIND_ORDER.get(x["kind"], 9),
+                                 _neg_date(x.get("date") or "")))
+        dropped.sort(key=lambda x: (KIND_ORDER.get(x["kind"], 9),
+                                    _neg_date(x.get("date") or "")))
     return kept, dupes, dropped
 
 
@@ -602,8 +745,16 @@ def _gemini_api(prompt: str) -> dict:
 
 
 def gemini_analyze(prompt: str, batch_label: str) -> dict:
-    """Web (Flash + Extended) first; fall back to the API-key backend."""
-    if FETCH_SOURCE not in ("api_only",):
+    """Web (Flash + Extended) first; fall back to the API-key backend.
+
+    GEMINI_WEB_DEAD=1 (set by the workflow's liveness preflight when the
+    web session is dead) skips the web attempts entirely: three timed-out
+    web attempts would otherwise burn up to 15 minutes before the fallback
+    is even tried."""
+    if os.environ.get("GEMINI_WEB_DEAD") == "1":
+        log("  gemini(web) skipped — liveness preflight reported it dead")
+        res = {"ok": False, "err": "skipped-by-preflight"}
+    elif FETCH_SOURCE not in ("api_only",):
         res = _gemini_web(prompt, batch_label)
         if res.get("ok"):
             return res
@@ -615,6 +766,56 @@ def gemini_analyze(prompt: str, batch_label: str) -> dict:
     if api.get("ok"):
         return api
     return {"ok": False, "err": f"web={res.get('err')} api={api.get('err')}"}
+
+
+def _truncate_abstract(ab: str, budget: int) -> str:
+    """Sentence-aware truncation that keeps RESULTS / CONCLUSIONS.
+
+    A hard character cut usually lands mid-Results — the most important part
+    of a structured abstract — and the model then summarises a trial from its
+    Methods without the cut being visible. Prefer: the head (Background /
+    Methods) up to a third of the budget, then the RESULTS and CONCLUSIONS
+    sections, each cut at a sentence boundary. Falls back to a sentence-end
+    cut when the abstract carries no section labels."""
+    ab = (ab or "").strip()
+    if len(ab) <= budget:
+        return ab
+
+    def _sent_cut(s: str, limit: int) -> str:
+        s = s[:limit].strip()
+        cut = max(s.rfind(". "), s.rfind("! "), s.rfind("? "))
+        return s[:cut + 1].strip() if cut > len(s) * 0.5 else s
+
+    low = ab.lower()
+    res_at = low.find("results:")
+    con_at = low.find("conclusions:")
+    if res_at < 0 and con_at < 0:
+        return _sent_cut(ab, budget)
+    head_budget = max(300, budget // 3)
+    parts = [_sent_cut(ab[:res_at if res_at >= 0 else con_at], head_budget)]
+    rest_budget = budget - len(parts[0])
+    if res_at >= 0:
+        res_end = con_at if con_at > res_at else len(ab)
+        res_txt = ab[res_at:res_end].strip()
+        take = min(len(res_txt), int(rest_budget * 0.65))
+        parts.append(_sent_cut(res_txt, take))
+        rest_budget -= len(parts[-1])
+    if con_at >= 0:
+        parts.append(_sent_cut(ab[con_at:].strip(), max(200, rest_budget)))
+    out = " ".join(p for p in parts if p)
+    return out[:budget]
+
+
+def _block_pmids(text: str) -> set:
+    """PMIDs carried by the digest's `### ` item blocks."""
+    pmids = set()
+    for chunk in re.split(r"\n(?=###\s)", text or ""):
+        if not chunk.lstrip().startswith("###"):
+            continue
+        m = re.search(r"PMID\s+(\d{6,9})", chunk)
+        if m:
+            pmids.add(m.group(1))
+    return pmids
 
 
 # ── Analysis prompt ──────────────────────────────────────────────────────────
@@ -658,7 +859,10 @@ def build_prompt(items: list[dict], part: int, n_parts: int) -> str:
         "state the finding in max 25 words, and end with exactly 'Why it "
         "matters: <practice change in max 20 words>'. Shape: "
         "- {issuing body/journal, PMID}: {finding, max 25 words}. "
-        "Why it matters: {practice change, max 20 words}.",
+        "Why it matters: {practice change, max 20 words}. "
+        "If no item this week would change practice, write the single line "
+        "'No practice-changing developments this week' instead of inflating "
+        "minor items.",
         "",
         "## Guideline watch",
         "- Do NOT write a Guideline watch section yourself — it is built "
@@ -669,9 +873,12 @@ def build_prompt(items: list[dict], part: int, n_parts: int) -> str:
         "",
         "### <short title, max 90 characters>",
         "- **Citation**: <Journal> - <date> - PMID <pmid> "
-        "(https://pubmed.ncbi.nlm.nih.gov/<pmid>/)",
+        "(https://pubmed.ncbi.nlm.nih.gov/<pmid>/) - DOI <doi, if given> "
+        "(https://doi.org/<doi>)",
         "- **Type**: <Clinical practice guideline | Expert consensus | "
         "Randomised trial | Meta-analysis | Systematic review | Study>",
+        "- **Design**: <study design in max 8 words, with N and follow-up "
+        "if stated, e.g. 'multicentre double-blind RCT, N=412, 12 wk'>",
         "- **What it says**: 2-3 sentences with the ACTUAL recommendations or "
         "findings and their key numbers - effect sizes with 95% CI, HR/OR/RR, "
         "absolute differences, event counts, N, endpoints (survival, "
@@ -710,13 +917,15 @@ def build_prompt(items: list[dict], part: int, n_parts: int) -> str:
         head.append("- " + LANG_LINE[DIGEST_LANG.lower()])
     head += ["", "Items:", ""]
     for it in items:
-        ab = (it.get("abstract") or "")[:ABSTRACT_CHARS]
+        ab = _truncate_abstract(it.get("abstract") or "", ABSTRACT_CHARS)
         authors = it.get("authors") or []
         au = ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else "")
         head.append(f"### {it['kind'].upper()} | PMID {it['pmid']}")
         head.append(f"Title: {it['title']}")
         head.append(f"Journal: {it.get('journal','?')} | "
                     f"Date: {it.get('date','?')} | Query: {it.get('query','')}")
+        if it.get("doi"):
+            head.append(f"DOI: {it['doi']}")
         if au:
             head.append(f"Authors: {au}")
         head.append(f"Abstract: {ab if ab else '(no abstract available)'}")
@@ -728,6 +937,7 @@ def analyze(items: list[dict]) -> dict:
     batches = [items[i:i + BATCH_SIZE]
                for i in range(0, len(items), BATCH_SIZE)] or [[]]
     texts, backends, errors = [], [], []
+    covered: set = set()
     for i, b in enumerate(batches, 1):
         if not b:
             continue
@@ -737,13 +947,14 @@ def analyze(items: list[dict]) -> dict:
         if res.get("ok") and res.get("text", "").strip():
             texts.append(res["text"].strip())
             backends.append(res.get("backend", "?"))
+            covered |= _block_pmids(res["text"])
             log(f"  batch {i} ok via {res.get('backend')} "
                 f"({len(res['text'])} chars, {time.time()-t0:.0f}s)")
         else:
             errors.append(f"batch {i}: {str(res.get('err'))[:200]}")
             log(f"  batch {i} FAILED: {str(res.get('err'))[:200]}")
     return {"text": "\n\n".join(texts), "backends": backends,
-            "errors": errors, "ok": bool(texts)}
+            "errors": errors, "ok": bool(texts), "covered": covered}
 
 
 def dedupe_digest_blocks(digest_text: str) -> tuple:
@@ -780,17 +991,26 @@ def audit_digest(items: list, digest_text: str) -> dict:
 
     A clinical digest that states a number its abstract does not contain is the
     one failure mode that actually matters, so this runs on every CI run, logs
-    the finding and surfaces it in the email footer."""
+    the finding and surfaces it in the email footer.
+
+    Every block is audited, including blocks for PMIDs outside the analysed
+    set — a model-invented PMID must surface as 'PMID not found on PubMed',
+    never ship untraced. Numbers are checked against the SAME truncated
+    abstract text the model was given: a number that only appears past the
+    truncation point could not have been grounded, however correct it is."""
     try:
         import digest_audit as da
     except Exception as e:  # noqa: BLE001
         log(f"  audit: import failed ({e}) — skipped")
         return {"ran": False, "errors": [], "warnings": []}
     try:
-        blocks = [b for b in da.parse_blocks(digest_text)
-                  if b["pmid"] in {it["pmid"] for it in items}]
+        blocks = da.parse_blocks(digest_text)
+        truncated = {it["pmid"]: _truncate_abstract(it.get("abstract") or "",
+                                                     ABSTRACT_CHARS)
+                     for it in items}
         src = da.fetch_abstracts([b["pmid"] for b in blocks])
-        findings = da.audit(blocks, src)
+        findings = da.audit(blocks, src, truncated=truncated,
+                            focus=da.parse_focus_bullets(digest_text))
         errs = [f for f in findings if f["level"] == "error"]
         warns = [f for f in findings if f["level"] == "warn"]
         log(f"  audit: {len(blocks)} block(s) traced to {len(src)} abstract(s) "
@@ -1233,12 +1453,6 @@ def gihep_notebook_sources(items: list, digest_text: str,
     return out
 
 
-LIVER_RE = re.compile(
-    r"\b(hepat|liver|cirrhos|hcc|hepatocellular|biliary|cholest|mash|masld|"
-    r"nafld|hbv|hcv|portal|varice|ascites|fibroscan|endoscop\w* varice)\b",
-    re.I)
-
-
 def plan_dashboards(items: list, max_c = None) -> list:
     """Split the window into thematic dashboards.
 
@@ -1250,9 +1464,8 @@ def plan_dashboards(items: list, max_c = None) -> list:
              if it["kind"] in ("trial", "meta-analysis", "systematic review")]
     plans = [
         {"key": "guidance", "notebook": "Guidance & Consensus",
-         "caption": "New guidance & consensus — every recommendation in this "
-                    "window's guidelines and expert statements (Gemini "
-                    "NotebookLM)",
+         "caption": "New guidance & consensus — up to 8 guidelines and expert "
+                    "statements in this window (Gemini NotebookLM)",
          "items": guide[:8]},
         {"key": "trials", "notebook": "Trials & Meta-analyses",
          "caption": "Pivotal trials & meta-analyses — populations, comparators "
@@ -1285,10 +1498,11 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
         "a text-and-icons layout. Do NOT show scores, ratings, rankings, GRADE "
         "letters or p-values of your own.\n"
         "Before you finish, re-read every label and every number against the "
-        "sources and correct any word that does not appear there — typical "
-        "slips to check for: 'Caase' (should be 'Cease'), 'Non-clrrhotic', "
-        "'pancreatib', 'es vivo', 'Deducted', 'Al' (should be 'AI'), and "
-        "confidence levels (a 95% CI must never be printed as 98% CI). Keep the "
+        "sources and correct any word that does not appear there — for "
+        "example, past slips included 'Caase' (should be 'Cease'), "
+        "'Non-clrrhotic', 'pancreatib', 'es vivo', 'Deducted', 'Al' (should "
+        "be 'AI'), and confidence levels (a 95% CI must never be printed as "
+        "98% CI). Keep the "
         "source's direction wording too ('did not significantly improve' must "
         "not become a bare 'not superior'). Never "
         "abbreviate a society or journal, never restate a confidence interval "
@@ -1361,8 +1575,12 @@ def dashboard_context(plan: dict, digest_text: str, date_range: str,
 NLM_BUDGET = int(os.environ.get("NLM_BUDGET") or 900)
 
 
-def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
+def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420,
+                  date_label: str = "") -> tuple:
     """Generate a fresh artifact; fall back to the newest completed one.
+
+    Returns (url, reused): reused is True when the image came from the
+    fallback instead of a fresh generation, so the email can say so.
 
     The vendored helper reuses today's artifact BEFORE generating, which is
     right for a daily digest but silently serves a stale image when the prompt
@@ -1375,7 +1593,7 @@ def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
                          "--wait", "-n", nb], timeout=timeout)
             url = d.get("url", "")
             if url:
-                return url
+                return url, False
             break
         except RuntimeError as e:
             msg = str(e)
@@ -1383,7 +1601,7 @@ def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
             if "ratelimit" in low or "rate limit" in low:
                 log("  NLM: daily artifact cap reached — reusing the latest "
                     "completed infographic")
-                return _nlm_latest_infographic_url(di, nb)
+                return _nlm_latest_infographic_url(di, nb, date_label)
             if attempt == 1 and ("authentication" in low
                                  or "unexpected_error" in low):
                 try:
@@ -1393,7 +1611,7 @@ def _nlm_generate(di, nb: str, instructions: str, timeout: int = 420) -> str:
                 continue
             log(f"  NLM generate error: {msg[:180]}")
             break
-    return _nlm_latest_infographic_url(di, nb)
+    return _nlm_latest_infographic_url(di, nb, date_label)
 
 
 AUTH_DEAD_RE = re.compile(
@@ -1425,29 +1643,46 @@ def _nlm_add_sources(di, nb: str, srcs: list, deadline: float) -> int:
     return added
 
 
-def _nlm_latest_infographic_url(di, nb: str) -> str:
+def _nlm_latest_infographic_url(di, nb: str, date_label: str = "") -> tuple:
     """Fallback: newest completed Infographic in the notebook — covers both the
-    daily artifact cap and a --wait that returns without a url."""
+    daily artifact cap and a --wait that returns without a url.
+
+    Prefers artifacts created today (date_label, YYYY-MM-DD); falls back to
+    the newest overall only when nothing from today exists. Returns
+    (url, reused)."""
     try:
         d = di._nlm(["art", "list", "-n", nb])
         cands = [a for a in d.get("artifacts", [])
                  if a.get("type") == "Infographic"
                  and a.get("status") == "completed"]
         if not cands:
-            return ""
-        latest = max(cands, key=lambda a: a.get("created_at", ""))
-        return di._nlm(["art", "get", latest["id"], "-n", nb]).get("url", "")
+            return "", False
+        today = [a for a in cands
+                 if date_label
+                 and str(a.get("created_at", "")).startswith(date_label)]
+        pool = today or cands
+        latest = max(pool, key=lambda a: a.get("created_at", ""))
+        url = di._nlm(["art", "get", latest["id"], "-n", nb]).get("url", "")
+        return url, bool(url)
     except Exception as e:  # noqa: BLE001
         log(f"  NLM url fallback failed: {str(e)[:160]}")
-        return ""
+        return "", False
 
 
 def make_notebooklm_infographics(items: list, digest_text: str,
                                  date_label: str,
-                                 date_range: str = "") -> list:
+                                 date_range: str = "",
+                                 deadline: float | None = None) -> list:
     """Generate one deep NotebookLM dashboard per theme.
 
-    Returns [{'key','label','path'}] for every dashboard that rendered."""
+    Returns [{'key','label','path','reused'}] for every dashboard that
+    rendered; 'reused' is True when the image came from the fallback instead
+    of a fresh generation.
+
+    The phase budget is measured against the RUN deadline (deadline), not
+    from the start of this phase: a run that spent 10 minutes on analysis
+    and then takes the full 900 s NLM budget would otherwise hit the
+    workflow timeout with the email — the last step — still unsent."""
     try:
         import digest_infographic as di
     except Exception as e:  # noqa: BLE001
@@ -1459,22 +1694,26 @@ def make_notebooklm_infographics(items: list, digest_text: str,
     plans = plan_dashboards(items)[:NLM_ARTIFACTS]
     out_list = []
     t0 = time.time()
+    budget = NLM_BUDGET
+    if deadline:
+        budget = max(120, min(NLM_BUDGET, int(deadline - t0)))
+        log(f"  NLM: phase budget {budget}s (run deadline-relative)")
     for plan in plans:
         # Hard budget for the whole infographic phase: without it, three
         # dashboards x 7-minute artifact timeouts (+ a retry each) can outlive
         # the workflow's timeout-minutes and the run is killed before the email
         # is ever sent. Whatever rendered by then is what the email carries.
         spent = time.time() - t0
-        if spent > NLM_BUDGET:
+        if spent > budget:
             log(f"  NLM [{plan['key']}]: skipped — infographic budget "
-                f"{NLM_BUDGET}s exhausted ({spent:.0f}s spent)")
+                f"{budget}s exhausted ({spent:.0f}s spent)")
             continue
         title = (f"GI & Hepatology Weekly - {plan['notebook']} - {date_label}")
         try:
             nb = di.nlm_ensure_notebook(title)
             srcs = gihep_notebook_sources(plan["items"], digest_text,
                                           cap=plan.get("cap"))
-            added = _nlm_add_sources(di, nb, srcs, t0 + NLM_BUDGET)
+            added = _nlm_add_sources(di, nb, srcs, t0 + budget)
             if added == 0:
                 log(f"  NLM [{plan['key']}]: no sources attached — skipping")
                 continue
@@ -1483,17 +1722,19 @@ def make_notebooklm_infographics(items: list, digest_text: str,
                 f"sources attached ({studies} with RESULT lines)")
             instructions = dashboard_context(plan, digest_text, date_range,
                                             len(items))
-            remaining = max(120, NLM_BUDGET - int(time.time() - t0))
-            url = _nlm_generate(di, nb, instructions,
-                                timeout=min(420, remaining))
+            remaining = max(120, budget - int(time.time() - t0))
+            url, reused = _nlm_generate(di, nb, instructions,
+                                        timeout=min(420, remaining),
+                                        date_label=date_label)
             if not url and remaining > 240:
                 log(f"  NLM [{plan['key']}]: retrying once "
                     f"({remaining}s budget left)")
                 time.sleep(15)
-                url = _nlm_generate(di, nb, instructions,
-                                    timeout=min(420, remaining - 60))
+                url, reused = _nlm_generate(di, nb, instructions,
+                                            timeout=min(420, remaining - 60),
+                                            date_label=date_label)
             if not url:
-                url = _nlm_latest_infographic_url(di, nb)
+                url, reused = _nlm_latest_infographic_url(di, nb, date_label)
             if not url:
                 log(f"  NLM [{plan['key']}]: no artifact url returned")
                 continue
@@ -1501,9 +1742,10 @@ def make_notebooklm_infographics(items: list, digest_text: str,
                 OUT_DIR,
                 f"gihep_nlm_{plan['key']}_{datetime.now():%Y%m%d-%H%M}.png")
             di.nlm_download_image(url, out)
-            log(f"  NLM [{plan['key']}] downloaded: {out}")
+            log(f"  NLM [{plan['key']}] downloaded: {out}"
+                + (" (reused artifact)" if reused else ""))
             out_list.append({"key": plan["key"], "label": plan["caption"],
-                             "path": out})
+                             "path": out, "reused": reused})
         except Exception as e:  # noqa: BLE001
             log(f"  NLM [{plan['key']}] failed: {type(e).__name__}: "
                 f"{str(e)[:200]}")
@@ -1546,8 +1788,18 @@ def send_email(subject: str, html_body: str,
         return "unconfigured"
     if isinstance(image_paths, str):
         image_paths = [image_paths]
-    image_paths = [p for p in (image_paths or []) if p and os.path.exists(p)]
-    cids = cids or [f"infographic{i}" for i in range(len(image_paths))]
+    # Rebuild the CID list to match the files that actually exist: a
+    # caller-supplied list used as-is would reference a CID that was never
+    # attached if a file vanished between filtering and attaching.
+    pairs = []
+    for i, p in enumerate(image_paths or []):
+        if not p or not os.path.exists(p):
+            continue
+        cid = (cids[i] if cids and i < len(cids)
+               else f"infographic{len(pairs)}")
+        pairs.append((p, cid))
+    image_paths = [p for p, _ in pairs]
+    cids = [c for _, c in pairs]
     if image_paths:
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText("GI & Hepatology Weekly — enable HTML to view.",
@@ -1679,16 +1931,25 @@ def _strip_guideline_watch(head_md: str) -> str:
 
 
 def _guideline_watch_table(items: list[dict]) -> str:
-    """Deterministic Issuing body|Topic|PMID table (no LLM)."""
+    """Deterministic Issuing body|Topic|PMID table (no LLM).
+
+    The society comes from the title/abstract regex first, then the
+    journal->society fallback (the society is often inferable from the
+    journal when the text never names it). The topic carries an
+    Asia-Pacific tag when the item is recognisably Asia-Pacific."""
     trs = []
     for it in items or []:
         if (it.get("kind") or "") not in ("guideline", "consensus"):
             continue
         m = SOCIETY_RE.search((it.get("title") or "") + " "
                               + ((it.get("abstract") or "")[:400]))
-        soc = m.group(1) if m else "not stated"
+        soc = (m.group(1) if m
+               else JOURNAL_SOCIETY.get(it.get("journal") or "", "not stated"))
         topic = re.sub(r"\s+", " ",
                        (it.get("title") or "untitled")).strip()[:110]
+        tag = _asia_tag(it)
+        if tag:
+            topic += f" [{tag}]"
         trs.append(
             f"<tr><td>{_html.escape(soc)}</td>"
             f"<td>{_html.escape(topic)}</td>"
@@ -1709,12 +1970,20 @@ def _one_line(text: str, n: int = 20) -> str:
 
 
 def _synth_block(it: dict) -> str:
-    """Fallback full-card markdown for an item the model never blocked."""
+    """Fallback full-card markdown for an item the model never blocked.
+
+    Marked '[summary unavailable]' in the title so a skim reader can tell
+    it apart from a real summary — the card is the raw abstract, not an
+    analysis."""
     ab = re.sub(r"\s+", " ", (it.get("abstract") or "")).strip()
+    doi = (it.get("doi") or "").strip()
+    cite = (f"{it.get('journal', '?')} - {it.get('date', '')} - "
+            f"PMID {it['pmid']} (https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/)")
+    if doi:
+        cite += f" - DOI {doi} (https://doi.org/{doi})"
     return (
-        f"### {(it.get('title') or 'untitled')[:90]}\n"
-        f"- **Citation**: {it.get('journal', '?')} - {it.get('date', '')} - "
-        f"PMID {it['pmid']} (https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/)\n"
+        f"### [summary unavailable] {(it.get('title') or 'untitled')[:90]}\n"
+        f"- **Citation**: {cite}\n"
         f"- **Type**: {it.get('kind', 'study')}\n"
         f"- **What it says**: "
         f"{(ab[:300] if ab else 'not summarised — verify full text')}\n"
@@ -1726,15 +1995,22 @@ def _synth_block(it: dict) -> str:
 
 def _split_digest_for_email(items: list[dict], digest_text: str,
                             force_full: set | None = None) -> tuple:
-    """Split the analysed digest into (head_md, full_cards, compact_rows).
+    """Split the analysed digest into (head_md, changing_cards, worth_cards,
+    compact_rows).
 
     Full cards ONLY for guidelines/consensus and trials-with-numbers
     (capped at FULL_CARD_CAP); everything else ('no change', truncated
     abstracts with no numbers, editorials/corrigenda) goes to the compact
     'Also in this window' table. PMIDs in force_full (audit-flagged blocks)
     always get full cards — a flagged block must stay visible with its flag.
-    Item order is kept throughout — placement is by actionability (guidance
-    first), never by score."""
+    Full cards split deterministically into 'Practice-changing' (the block's
+    Practice impact states a change) and 'Worth knowing' (it says no change
+    / supports current practice) — the old single heading overstated the
+    second group. Item order is kept throughout — placement is by
+    actionability (guidance first), never by score.
+
+    Blocks for PMIDs outside the analysed set are DROPPED, never delivered:
+    a block for a PMID we never fetched cannot be verified at all."""
     text = digest_text or ""
     m = re.search(r"(?m)^###\s", text)
     head_md = _strip_guideline_watch(text[:m.start()] if m else text)
@@ -1744,6 +2020,11 @@ def _split_digest_for_email(items: list[dict], digest_text: str,
             pm = re.search(r"PMID\s+(\d{6,9})", b)
             if pm and pm.group(1) not in blocks:
                 blocks[pm.group(1)] = b.strip()
+    known = {it["pmid"] for it in items or []}
+    dropped_unmatched = sorted(p for p in blocks if p not in known)
+    if dropped_unmatched:
+        log(f"  split: dropped {len(dropped_unmatched)} block(s) for PMIDs "
+            f"outside the analysed set: {', '.join(dropped_unmatched)}")
     notes = parse_digest_notes(text)
     full: list = []
     compact: list = []
@@ -1768,24 +2049,37 @@ def _split_digest_for_email(items: list[dict], digest_text: str,
     for it, blk in overflow:
         compact.append((it, blk, notes.get(it["pmid"], {})))
     full.extend(forced)  # audit-flagged: always visible, exempt from the cap
-    for pmid, blk in blocks.items():
-        if pmid not in {it["pmid"] for it in items or []}:
-            full.append((None, blk))  # delivered but unmatched — keep visible
-    return head_md, full, compact
+    changing, worth = [], []
+    for pair in full:
+        blk = pair[1] or ""
+        impact = re.search(r"\*\*Practice impact\*\*:\s*(.*)", blk)
+        if impact and "no change to current practice" in impact.group(1).lower():
+            worth.append(pair)
+        else:
+            changing.append(pair)
+    return head_md, changing, worth, compact
 
 
 def render_email(date_label: str, digest_text: str, items: list[dict],
                  also_indexed: list[dict], cids: list[str],
                  meta_note: str, labels: list | None = None,
                  verification: dict | None = None,
-                 nlm_note: bool = False, chart_led: bool = True) -> str:
+                 nlm_note: bool = False, chart_led: bool = True,
+                 n_analysed: int | None = None, n_unanalysed: int = 0,
+                 retractions: list | None = None) -> str:
+    """Render the digest email.
+
+    n_analysed / n_unanalysed are the COUNTS OF WHAT WAS ACTUALLY
+    DELIVERED (items the model blocked vs items shown from the raw abstract
+    only) — the header and subject must never claim more than that."""
     labels = labels or ["Evidence mix this week (rendered from the digest "
                         "data: type, journal and issuing-body counts)"]
-    head_md, full_cards, compact_rows = _split_digest_for_email(
-        items, digest_text,
-        force_full={str(f.get("pmid", ""))
-                    for f in (verification or {}).get("errors", []) or []
-                    if f.get("pmid")})
+    head_md, changing_cards, worth_cards, compact_rows = \
+        _split_digest_for_email(
+            items, digest_text,
+            force_full={str(f.get("pmid", ""))
+                        for f in (verification or {}).get("errors", []) or []
+                        if f.get("pmid")})
     guide_table = _guideline_watch_table(items)
     chart_html, dash_html = "", ""
     if cids:
@@ -1810,7 +2104,14 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
             dash_html = "".join(parts) + "<hr/>"
     verification = verification or {}
     verify_html = ""
-    if verification.get("ran"):
+    if not verification.get("ran"):
+        # The number check is the one gate that matters for a clinical
+        # digest — if it never ran, the reader must know, not assume.
+        verify_html = (
+            "<div class='banner' style='border-left-color:#c0392b'>"
+            "Number check did not run this week — verify figures against "
+            "the abstracts before acting on them.</div>")
+    elif verification.get("ran"):
         n_err = len(verification.get("errors") or [])
         n_warn = len(verification.get("warnings") or [])
         n_blk = verification.get("blocks") or 0
@@ -1833,26 +2134,55 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
                 f"{audit_line}. Number check: {n_err} figure(s) could NOT be "
                 f"traced to the source abstract — treat these as unverified "
                 f"(flagged \u26a0 inline): {listed}</div>")
-    src_rows = "".join(
-        f"<tr><td>{it['kind']}</td><td>{(it.get('journal') or '?')}</td>"
-        f"<td>{it.get('date','')}</td>"
-        f"<td><a href='https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/'>"
-        f"PMID {it['pmid']}</a></td>"
-        f"<td>{_html.escape((it.get('title') or '')[:110])}</td></tr>"
-        for it in items)
+    def _src_row(it: dict) -> str:
+        doi = (it.get("doi") or "").strip()
+        doi_html = (f" · <a href='https://doi.org/{_html.escape(doi)}'>"
+                    f"doi</a>" if doi else "")
+        title = re.sub(r"\s+", " ", (it.get("title") or "")).strip()[:110]
+        tag = _asia_tag(it)
+        if tag:
+            title += f" [{tag}]"
+        return (
+            f"<tr><td>{it['kind']}</td><td>{(it.get('journal') or '?')}</td>"
+            f"<td>{it.get('date','')}</td>"
+            f"<td><a href='https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/'>"
+            f"PMID {it['pmid']}</a>{doi_html}</td>"
+            f"<td>{_html.escape(title)}</td></tr>")
+
+    src_rows = "".join(_src_row(it) for it in items)
     also = ""
     if also_indexed:
+        # List every dropped item, not just the first 10: they are cheap
+        # text, and capping hides how many were dropped.
         rows = "".join(
             f"<li><a href='https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/'>"
             f"PMID {it['pmid']}</a> — {_html.escape((it.get('journal') or '?'))} "
             f"{it.get('date','')} — {_html.escape((it.get('title') or '')[:110])}"
             f" <span class='meta'>[{it['kind']}]</span></li>"
-            for it in also_indexed[:BREAKING_LIMIT])
-        also = (f"<h4>Also indexed this week (not analysed)</h4>"
+            for it in also_indexed)
+        also = (f"<h4>Also indexed this week (not analysed) — "
+                f"{len(also_indexed)} item(s)</h4>"
                 f"<ul class='also'>{rows}</ul>")
-    full_md = "\n\n".join(blk for _, blk in full_cards).strip()
-    full_html = (f"<h4>Practice-changing cards</h4>{md_to_htmlish(full_md)}"
-                 if full_md else "")
+    retr_html = ""
+    if retractions:
+        rows = "".join(
+            f"<li><a href='https://pubmed.ncbi.nlm.nih.gov/{it['pmid']}/'>"
+            f"PMID {it['pmid']}</a> — {_html.escape((it.get('journal') or '?'))} "
+            f"{it.get('date','')} — {_html.escape((it.get('title') or '')[:130])}"
+            f"</li>"
+            for it in retractions)
+        retr_html = (
+            "<h4>Corrections &amp; retractions</h4>"
+            "<div class='banner' style='border-left-color:#c0392b'>"
+            "The following were retracted or corrected — check any earlier "
+            "digest that covered them before relying on them.</div>"
+            f"<ul class='also'>{rows}</ul>")
+    changing_md = "\n\n".join(blk for _, blk in changing_cards).strip()
+    changing_html = (f"<h4>Practice-changing cards</h4>"
+                     f"{md_to_htmlish(changing_md)}" if changing_md else "")
+    worth_md = "\n\n".join(blk for _, blk in worth_cards).strip()
+    worth_html = (f"<h4>Worth knowing</h4>{md_to_htmlish(worth_md)}"
+                  if worth_md else "")
     compact_html = ""
     if compact_rows:
         trs = []
@@ -1871,6 +2201,11 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
             "<h4>Also in this window</h4><table><tr><th>Title</th><th>Type</th>"
             "<th>Finding (\u226420 words)</th></tr>" + "".join(trs)
             + "</table>")
+    n_analysed = len(items) if n_analysed is None else n_analysed
+    analysed_line = f"{n_analysed} item(s) analysed"
+    if n_unanalysed:
+        analysed_line += (f" ({n_unanalysed} shown from the abstract only — "
+                          f"the analysis did not cover them this run)")
     return (f"<html><head><meta charset='utf-8'>{CSS}</head><body>"
             + f"<h1>GI &amp; Hepatology Weekly</h1>"
             + f"<div class='meta'>Guidelines, consensus statements and clinical "
@@ -1878,7 +2213,7 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
             + f"Gemini Flash + Extended Thinking"
             + (f" ({_html.escape(meta_note)})" if meta_note else "")
             + f". Window: last {WINDOW_DAYS} days. "
-            + f"{len(items)} item(s) analysed.</div>"
+            + f"{analysed_line}.</div>"
             + f"<div class='banner'>Ranking-free digest: every new guideline, "
             + f"consensus statement, randomised trial and meta-analysis in "
             + f"gastroenterology &amp; hepatology for this window is summarised "
@@ -1886,8 +2221,10 @@ def render_email(date_label: str, digest_text: str, items: list[dict],
             + f"actionability, not by score.</div>"
             + f"<hr/>{md_to_htmlish(head_md)}"
             + f"<hr/>{guide_table}"
+            + (f"<hr/>{retr_html}" if retr_html else "")
             + (f"<hr/><h4>Evidence mix</h4>{chart_html}" if chart_html else "")
-            + (f"<hr/>{full_html}" if full_html else "")
+            + (f"<hr/>{changing_html}" if changing_html else "")
+            + (f"<hr/>{worth_html}" if worth_html else "")
             + (f"<hr/>{compact_html}" if compact_html else "")
             + (f"<hr/>{dash_html}" if dash_html else "")
             + f"<hr/><h4>Items analysed this week</h4>"
@@ -1915,6 +2252,26 @@ def render_warn_email(date_label: str, detail: str) -> str:
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+def _write_archive(date_label: str, manifest: dict, html_body: str) -> None:
+    """Write the sent digest's archive: HTML + run manifest.
+
+    The archive is committed by the workflow after every successful run, so
+    the repo records what was sent — and the push resets the 60-day
+    auto-disable clock. Best-effort: a failure here must never block the
+    email, which is already sent by the time this runs."""
+    try:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        with open(os.path.join(ARCHIVE_DIR, f"{date_label}.html"), "w",
+                  encoding="utf-8") as f:
+            f.write(html_body)
+        with open(os.path.join(ARCHIVE_DIR, f"{date_label}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(manifest, f, indent=1, ensure_ascii=False)
+        log(f"archive written: {date_label}.html + .json")
+    except Exception as e:  # noqa: BLE001
+        log(f"archive write failed (non-fatal): {e}")
+
+
 def main() -> int:
     t_start = time.time()
     now = datetime.now(timezone.utc)
@@ -1956,13 +2313,19 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             log(f"  ERROR epmc supplement: {e}")
 
+    # Corrections & retractions are listed, never analysed.
+    retractions = [it for it in items if it.get("kind") == "retraction"]
+    items = [it for it in items if it.get("kind") != "retraction"]
+    if retractions:
+        log(f"  retractions/corrections: {len(retractions)}")
+
     seen = _load_seen()
     log(f"Seen-cache: {len(seen)} known PMID(s)")
     todo, dupes, dropped = select_items(items, seen)
     log(f"Fetched {len(items)} unique item(s); {len(dupes)} already reported; "
         f"{len(todo)} to analyse; {len(dropped)} over capacity")
 
-    if not items:
+    if not items and not retractions:
         detail = "\n".join(errors) or "no errors reported — genuinely empty window"
         subj = f"GI & Hepatology Weekly — WARN (no items) {date_label}"
         body = render_warn_email(date_label, detail)
@@ -1980,14 +2343,57 @@ def main() -> int:
             "## Week in focus\n- No new guidelines, consensus statements or "
             "clinical studies were newly indexed for this window "
             "(everything fetched was already reported in a previous run).",
-            [], [], [], "no new items")
-        send_email(f"GI & Hepatology Weekly — no new items {date_label}", body)
+            [], [], [], "no new items", retractions=retractions)
+        subj = f"GI & Hepatology Weekly — no new items {date_label}"
+        if retractions:
+            subj = (f"GI & Hepatology Weekly — no new items, "
+                    f"{len(retractions)} correction(s) {date_label}")
+        send_email(subj, body)
         return 0
 
     analysis = analyze(todo)
     analysis["text"], _dropped = dedupe_digest_blocks(analysis.get("text", ""))
+    # Delivered counts: what the model actually blocked, vs what is shown
+    # from the raw abstract only (synth fallback). The subject and header
+    # report these, never the fetched count.
+    covered = _block_pmids(analysis["text"])
+    analysed = [it for it in todo if it["pmid"] in covered]
+    unanalysed = [it for it in todo if it["pmid"] not in covered]
+    if unanalysed:
+        log(f"  {len(unanalysed)} item(s) not covered by the analysis "
+            f"(abstract-only cards): "
+            f"{', '.join(it['pmid'] for it in unanalysed[:8])}")
     verification = audit_digest(todo, analysis["text"])
+    # P-value leakage into the email body: the prompt forbids p-values and
+    # the infographic path strips them, but the email text itself was never
+    # scanned. Log leaks and surface them as audit warnings.
+    pval_hits = [m.group(0).strip() for m in
+                 list(PVAL_GROUP_RE.finditer(analysis["text"]))
+                 + list(PVAL_RE.finditer(analysis["text"]))]
+    if pval_hits:
+        log(f"  p-value leak: {len(pval_hits)} occurrence(s) in the digest "
+            f"text ({', '.join(sorted(set(pval_hits))[:5])})")
+        verification.setdefault("warnings", []).append({
+            "pmid": "", "level": "warn",
+            "issue": f"{len(pval_hits)} p-value(s) leaked into the digest "
+                     f"text despite the no-p-values rule"})
     analysis["text"] = apply_audit_badges(analysis["text"], verification)
+    # Archive the audit result alongside the digest: the workflow uploads it
+    # and the alert step reads it (the old grep over a never-written .log
+    # file was a no-op).
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(os.path.join(os.path.dirname(STATE_FILE),
+                               f"audit_{date_label}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"date": date_label,
+                       "blocks": verification.get("blocks", 0),
+                       "sources": verification.get("sources", 0),
+                       "errors": verification.get("errors", []),
+                       "warnings": verification.get("warnings", [])},
+                      f, indent=1, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        log(f"audit json write failed (non-fatal): {e}")
     if not analysis["ok"]:
         detail = "\n".join(errors + analysis["errors"])
         log(f"Gemini analysis failed on every batch — WARN email. "
@@ -2005,7 +2411,11 @@ def main() -> int:
         log(f"ERROR chart render: {type(e).__name__}: {e}")
     date_range = f"{start:%Y-%m-%d} to {end:%Y-%m-%d}"
     dashboards = make_notebooklm_infographics(todo, analysis["text"],
-                                             date_label, date_range)
+                                             date_label, date_range,
+                                             deadline=t_start + RUN_DEADLINE_S)
+    if any(d.get("reused") for d in dashboards):
+        reuse_note = "one or more dashboards reused from an earlier run"
+        meta_note = f"{meta_note}; {reuse_note}" if meta_note else reuse_note
     labels = ["Evidence mix this week (rendered from the digest data: type, "
               "journal and issuing-body counts)"]
     if not dashboards:
@@ -2031,9 +2441,16 @@ def main() -> int:
     nlm_note = any(d.get("key") != "poster" for d in dashboards)
     body = render_email(date_label, analysis["text"], todo, dropped, cids,
                         meta_note, img_labels, verification,
-                        nlm_note=nlm_note, chart_led=bool(chart))
-    subj = (f"GI & Hepatology Weekly — {len(todo)} item(s) "
-            f"(guidelines, consensus & trials) {date_label}")
+                        nlm_note=nlm_note, chart_led=bool(chart),
+                        n_analysed=len(analysed),
+                        n_unanalysed=len(unanalysed),
+                        retractions=retractions)
+    if unanalysed:
+        subj = (f"GI & Hepatology Weekly — {len(analysed)}/{len(todo)} "
+                f"item(s) analysed {date_label}")
+    else:
+        subj = (f"GI & Hepatology Weekly — {len(todo)} item(s) "
+                f"(guidelines, consensus & trials) {date_label}")
     status = send_email(subj, body, imgs, cids)
 
     if status == "sent":
@@ -2042,12 +2459,34 @@ def main() -> int:
         seen = _prune_seen(seen)
         _save_seen(seen)
         log(f"Seen-cache updated: {len(seen)} entries")
+        _write_archive(date_label, {
+            "date": date_label,
+            "window_days": WINDOW_DAYS,
+            "date_range": date_range,
+            "items_analysed": [it["pmid"] for it in analysed],
+            "items_unanalysed": [it["pmid"] for it in unanalysed],
+            "items_dropped_over_capacity": [it["pmid"] for it in dropped],
+            "retractions": [it["pmid"] for it in retractions],
+            "backends": sorted({b for b in analysis["backends"] if b}),
+            "audit_errors": verification.get("errors", []),
+            "audit_warnings": verification.get("warnings", []),
+            "dashboards": [d["key"] for d in dashboards],
+            "dashboards_reused": [d["key"] for d in dashboards
+                                  if d.get("reused")],
+            "email_status": status,
+        }, body)
 
-    log(f"=== done in {time.time()-t_start:.0f}s — {len(todo)} analysed, "
+    log(f"=== done in {time.time()-t_start:.0f}s — {len(analysed)} analysed, "
+        f"{len(unanalysed)} abstract-only, "
         f"{len(imgs)} infographic(s), backend {meta_note}, email {status} ===")
+    # A partial run still ships the email, but it is NOT green: any failed
+    # batch, or an email that never left, exits 2 so the failure is visible.
+    if status not in ("sent", "dry-run", "unconfigured"):
+        log(f"email send failed ({status}) — exit 2")
+        return 2
     if analysis["errors"]:
         log(f"(partial batch failures: {analysis['errors']})")
-        return 0 if len(analysis["errors"]) < max(1, len(todo) // BATCH_SIZE + 1) else 2
+        return 2
     return 0
 
 
