@@ -37,18 +37,24 @@ on:
         type: string
 
 permissions:
-  contents: read
+  # write: the run commits its digest archive + seen-PMID state back to the
+  # repo after every successful run — that push is what resets GitHub's
+  # 60-day scheduled-workflow auto-disable clock.
+  contents: write
 
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     concurrency:
       group: gi-hep-digest
       cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the archive-commit step rebases before pushing.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -94,6 +100,37 @@ jobs:
             "$GEMINI_SID" "$GEMINI_TS" > ~/.gemini-cli/auth.json
           python3 -c "import json;d=json.load(open('$HOME/.gemini-cli/auth.json'));print('gemini cookies:', 1 if d.get('__Secure-1PSID') else 0)"
 
+      - name: Check Gemini backends (liveness)
+        # Presence is checked above; this checks VALIDITY. A dead web session
+        # used to surface only as a failed analysis batch mid-run, after the
+        # fetch — and three timed-out web attempts burn ~15 min before the
+        # API fallback is even tried. Never fails the job itself: if the web
+        # session is dead we skip straight to the API backend (GEMINI_WEB_DEAD)
+        # and let the run decide; if the API key is dead too, the run fails
+        # with a clear error instead of a misleading auth error.
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          WEB_OK=0
+          if timeout 120 python3 gemini.py --account-status > /tmp/gemini_status.json 2>/tmp/gemini_status.err; then
+            if python3 -c "import json,sys; sys.exit(0 if json.load(open('/tmp/gemini_status.json')).get('ok') else 1)"; then
+              WEB_OK=1
+              echo "gemini web auth: live"
+            else
+              echo "::warning::gemini web auth check returned ok=false — API backend will be used"
+            fi
+          else
+            echo "::warning::gemini web auth check failed (see log) — API backend will be used"
+          fi
+          if [ "$WEB_OK" != "1" ]; then
+            echo "GEMINI_WEB_DEAD=1" >> "$GITHUB_ENV"
+          fi
+          if curl -s -m 30 "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}" | grep -q '"models"'; then
+            echo "gemini api key: valid"
+          else
+            echo "::warning::gemini API key did not list models — the API fallback may be unavailable"
+          fi
+
       - name: Setup NotebookLM session (storage state)
         env:
           NLM_STORAGE_STATE_GZ: ${{ secrets.NLM_STORAGE_STATE_GZ }}
@@ -102,6 +139,14 @@ jobs:
           printf '%s' "$NLM_STORAGE_STATE_GZ" | base64 -d | gunzip > \
             ~/.notebooklm/profiles/default/storage_state.json
           python3 -c "import json;d=json.load(open('$HOME/.notebooklm/profiles/default/storage_state.json'));print('nlm cookies:',len(d.get('cookies',[])))"
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # Static key: the install step below skips the download when the
+          # browser is already present, so the cache saves minutes every run.
+          key: ms-playwright-${{ runner.os }}-v1
 
       - name: Install playwright (NotebookLM image download)
         run: |
@@ -152,7 +197,39 @@ jobs:
           retention-days: 7
 
       - name: Alert on audit errors
+        # Reads the audit JSON the run writes to state/audit_<date>.json
+        # (the old grep over a .log file that was never written was a no-op).
         if: always()
         run: |
-          grep -a "AUDIT ERROR" "$HOME/.hermes/digest_images/gihep_*.log" 2>/dev/null \
-            && echo "::warning::digest_audit reported number errors — see inline ⚠ badges" || true
+          python3 - <<'EOF'
+          import glob, json
+          files = sorted(glob.glob("state/audit_*.json"))
+          if not files:
+              print("::warning::no audit JSON found — the number check may not have run")
+          else:
+              d = json.load(open(files[-1]))
+              errs = d.get("errors", [])
+              warns = d.get("warnings", [])
+              print(f"audit {d.get('date')}: {d.get('blocks', 0)} blocks, "
+                    f"{len(errs)} error(s), {len(warns)} warning(s)")
+              if errs:
+                  print(f"::warning::digest_audit reported {len(errs)} number error(s) — see inline ⚠ badges")
+          EOF
+
+      - name: Commit digest archive (resets the 60-day clock)
+        # Commits the sent digest's HTML + run manifest and the updated
+        # seen-PMID state. The push is what keeps the scheduled workflow
+        # alive (GitHub disables schedules after 60 days of repo inactivity)
+        # and creates a permanent, browsable archive of every digest sent.
+        # Best-effort: a push failure must never fail the run, and nothing
+        # is committed when nothing was sent (dry run / WARN run).
+        if: always()
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add archive state/seen_ids.json 2>/dev/null || true
+          git diff --cached --quiet && exit 0
+          git commit -m "digest archive $(date +%F)"
+          git pull --rebase origin main || true
+          git push origin main
