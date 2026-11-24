@@ -13,28 +13,51 @@ on GitHub's runners and delivers the email.
 
 ```
 GitHub Actions (Mon 01:30 UTC)
-  ├── PubMed E-utilities — 4 queries:
+  ├── PubMed E-utilities — 6 queries:
   │     • guideline / consensus pub-types in GI-hepatology journals
   │     • guideline / consensus pub-types on GI-hepatology MeSH topics
   │     • RCTs, meta-analyses, systematic reviews in GI-hepatology journals
   │     • GI-hepatology major-topic trials in NEJM/Lancet/JAMA/Nat Med/…
-  │   (Europe PMC is the fallback source tier)
-  ├── Dedup against the seen-PMID cache (actions/cache, rolling key)
+  │     • guidelines / consensus in the major general journals (title words,
+  │       not MeSH — MeSH lags weeks behind indexing)
+  │     • retractions / errata in the GI journals (listed, never analysed)
+  │   (Europe PMC is the fallback source tier; per-query caps are paged
+  │    past, up to 100 per query, so a busy week never silently drops items)
+  ├── Dedup against the seen-PMID cache (actions/cache, rolling key, plus
+  │   the committed state/seen_ids.json — the cache alone evicts after 7 idle
+  │   days and a weekly cadence sits exactly on that boundary)
   ├── Gemini Flash + Extended Thinking — one block per item:
-  │     Citation · Type · What it says (effect sizes, no p-values) ·
+  │     Citation · Type · Design · What it says (effect sizes, no p-values) ·
   │     Practice impact · Caveat, preceded by "Week in focus" and
-  │     "Guideline watch"
+  │     "Guideline watch". Selection is kind-first with a floor of 8
+  │     trial/meta-analysis/review slots, so a guideline-heavy week cannot
+  │     push out every trial.
   ├── Verification gate (every run):
   │     • duplicate item blocks dropped (the model re-wrote an item with a
   │       different journal on a live run)
-  │     • every figure stated is traced back to its PubMed abstract; the email
-  │       footer reports "no unmatched numbers" or names the unverified ones
+  │     • blocks for PMIDs outside the analysed set are dropped, never
+  │       delivered — a block for a PMID we never fetched cannot be verified
+  │     • every figure stated is traced back to the SAME truncated abstract
+  │       text the model was given (What-it-says, Practice impact, Caveat and
+  │       the Week-in-focus bullets); a stated time unit must appear next to
+  │       its number in the source. The email footer reports "no unmatched
+  │       numbers" or names the unverified ones; if the check never ran, the
+  │       email says so in a banner instead of staying silent
   ├── Infographics:
   │     1. matplotlib evidence-mix chart (type / journal / issuing body counts)
   │     2. Gemini NotebookLM dashboard — "Guidance & consensus"
   │     3. Gemini NotebookLM dashboard — "Trials & meta-analyses"
   │     4. Gemini NotebookLM dashboard — "Practice signals"
-  └── One HTML email (text summary + all infographics inline)
+  ├── One HTML email (text summary + all infographics inline). The subject
+  │   and header report the counts of what was ACTUALLY delivered (items the
+  │   model blocked vs items shown from the raw abstract only) — never the
+  │   fetched count. A run with any failed analysis batch, or an email that
+  │   never left, exits 2.
+  └── After a sent email: the digest HTML + run manifest are committed to
+      archive/ together with state/seen_ids.json. The push resets GitHub's
+      60-day scheduled-workflow auto-disable clock and is the permanent
+      archive of every digest sent (the workflow was disabled for inactivity
+      on 2026-11-23 exactly because nothing was ever committed).
 
 The week is split into THREE NotebookLM dashboards on purpose: one artifact
 covering every item has to cram, which is where garbled text and dropped
@@ -103,11 +126,14 @@ numbers and its practice implication.
 | `ANALYSIS_MAX_ITEMS` | `34` | Cap on items analysed per run |
 | `MAX_GUIDE_CANDIDATES` / `MAX_TRIAL_CANDIDATES` | `25` / `15` | Per-query fetch caps |
 | `BATCH_SIZE` | `18` | Items per Gemini call |
-| `ABSTRACT_CHARS` | `1500` | Abstract characters sent per item |
+| `ABSTRACT_CHARS` | `2500` | Abstract characters sent per item (sentence-aware truncation that keeps RESULTS / CONCLUSIONS) |
+| `MIN_TRIAL_SLOTS` | `8` | Floor of trial/meta-analysis/review slots in the analysed set |
 | `GEMINI_MODEL` / `GEMINI_THINKING` | `flash` / `extended` | Web backend |
-| `GEMINI_API_MODEL` | `gemini-3.5-flash` | API fallback (then flash-lite, 2.5-flash) |
+| `GEMINI_API_MODEL` | `gemini-3.8-flash` | API fallback (then 3.6-flash, flash-lite, 2.5-flash). 3.5-flash is deprecated on the Developer API — requests to it are silently routed to 3.6-flash, so it is no longer the lead. |
+| `GEMINI_WEB_DEAD` | *(unset)* | `1` = skip the web backend entirely (set by the workflow's liveness preflight when the web session is dead) |
 | `NLM_ARTIFACTS` | `3` | How many NotebookLM dashboards to generate (guidance / trials / signals; `0` skips) |
 | `NLM_BUDGET` | `900` | Seconds for the whole infographic phase before remaining dashboards are skipped |
+| `RUN_DEADLINE_S` | `1500` | Seconds from run start by which the infographic phase must stop (the email is the last step; the phase budget is measured against this deadline, not from the phase start) |
 | `FETCH_SOURCE` | `auto` | `pubmed` \| `epmc` pins the tier |
 | `DIGEST_LANG` | `en` | `zh-Hant` writes the report in Traditional Chinese |
 | `DIGEST_DRY_RUN` | *(unset)* | `1` = run everything, send nothing |
@@ -123,8 +149,14 @@ audit: 26 block(s) traced to 25 abstract(s) — 0 number error(s), 0 warning(s)
 
 It re-fetches each item's PubMed record and checks that (a) no PMID gets two
 blocks, (b) every number, percentage, CI and confidence level the digest states
-appears in that item's abstract or title, (c) the block carries its What-it-says
-/ Practice-impact / Caveat lines, and (d) the cited journal matches PubMed. Run
+appears in that item's abstract or title — in What-it-says, Practice impact,
+Caveat AND the Week-in-focus bullets, and against the same truncated abstract
+text the model was given (a number that only appears past the truncation point
+could not have been grounded), (c) a stated time unit appears next to its number
+("12 months" when the abstract says "12 weeks" is flagged), (d) the block
+carries its What-it-says / Practice-impact / Caveat lines, and (e) the cited
+journal matches PubMed. Blocks for PMIDs outside the analysed set are audited
+too (they surface as "PMID not found on PubMed") and are never delivered. Run
 it by hand on any digest text:
 
 ```bash
@@ -144,6 +176,7 @@ cannot be traced are surfaced in the email rather than silently shipped.
 | `nlm.py` | NotebookLM CLI wrapper |
 | `gemini.py`, `urllib_session.py` | Gemini CLI (gemini-webapi, cookie auth) |
 | `digest_audit.py` | Trace digest numbers back to PubMed abstracts (CI gate) |
+| `test_review_fixes.py` | Offline logic test for the review fixes (30 checks, no network/secrets) — `python3 test_review_fixes.py` |
 | `nlm_cookie_sync.py` | Refresh the NotebookLM session jar + push the secret |
 | `refresh_gh_secrets.py` | Push Gemini cookies to GitHub secrets |
 | `.github/workflows/weekly.yml` | The scheduled job |
@@ -182,6 +215,36 @@ cannot be traced are surfaced in the email rather than silently shipped.
   `yt-finance-digest`). Do not fork their behaviour inside `gi_hep_weekly.py`;
   extend the vendored helpers so all three digests keep the same NLM fixes.
 * **Never fail silently:** no items *and* a source error → WARN email + exit 2.
+  A run with any failed analysis batch, or an email that never left, also exits
+  2 — a green run means the digest shipped whole. The audit result is written
+  to `state/audit_<date>.json` (uploaded as an artifact); the workflow's alert
+  step reads that JSON, not a log file.
+* **The run commits its archive.** After a sent email, `archive/<date>.html`
+  + `archive/<date>.json` (manifest: analysed/unanalysed PMIDs, backends, audit
+  errors, dashboards) and `state/seen_ids.json` are committed and pushed. That
+  push is what keeps the schedule alive — GitHub disables a scheduled workflow
+  after 60 days of repo inactivity, which is what happened on 2026-11-23. The
+  commit step is best-effort (`continue-on-error`) and runs after the email, so
+  a push conflict can never block delivery. The committed content holds no
+  secrets (no recipient address; `seen_ids.json` is PMIDs + dates).
+* **Liveness, not just presence.** The workflow checks the Gemini web session
+  (`gemini.py --account-status`) and the API key (models list) before the run;
+  a dead web session sets `GEMINI_WEB_DEAD=1` so the run skips straight to the
+  API backend instead of burning three timed-out web attempts. Cookies still
+  need a refresh when they die — the check only routes around them.
+* **Pinned dependencies.** `requirements.txt` pins exact versions (verified
+  green by the 2026-11-24 dry run). Bump one at a time and re-run a dry run.
+* **Playwright is cached** (`~/.cache/ms-playwright`, static key) — the browser
+  is not re-downloaded every run.
+* **Abstracts are truncated sentence-aware** (`_truncate_abstract()`): the head
+  up to a third of the budget, then RESULTS and CONCLUSIONS, each cut at a
+  sentence boundary. A hard character cut used to land mid-Results.
+* **Full cards split into "Practice-changing" and "Worth knowing"** by the
+  Practice-impact line; items the model never blocked carry a
+  "[summary unavailable]" title marker and are shown from the raw abstract.
+* **Guideline-watch society fallback:** journal → society map when the
+  title/abstract never names the issuing body; an Asia-Pacific tag marks
+  recognisably Asia-Pacific items.
 * **Dedup cache key must stay rolling** (`gihep-seen-${{ github.run_id }}` +
   `restore-keys: gihep-seen-`); a fixed key always hits, a hit skips the save,
   and the seen-cache freezes so every run re-reports the whole window.
