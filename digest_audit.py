@@ -94,6 +94,39 @@ NUM_RE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:%|mg|ml|mm|kg|weeks?|months?|years?|days?|"
     r"patients?|participants?|studies|trials?|cases|items)?")
 CI_RE = re.compile(r"\b(\d{2})\s*%\s*CI\b")
+# Time units whose confusion changes meaning (12 weeks vs 12 months): when
+# a stated number carries one, the unit must appear next to the number in
+# the source, not just the bare number somewhere in the abstract.
+TIME_UNIT_VARIANTS = {
+    "week": r"weeks?|wks?",
+    "month": r"months?|mos?",
+    "year": r"years?|yrs?",
+    "day": r"days?",
+}
+TIME_UNIT_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(weeks?|wks?|months?|mos?|years?|yrs?|days?)\b", re.I)
+
+
+def parse_focus_bullets(text: str) -> list:
+    """'## Week in focus' bullets: [{pmid, text}].
+
+    The focus bullets cite PMIDs and state findings in ≤25 words, but
+    parse_blocks() only takes '### ' blocks, so they were never traced."""
+    out = []
+    m = re.search(r"(?mi)^##\s+Week in focus\s*$", text or "")
+    if not m:
+        return out
+    head = text[m.end():]
+    end = re.search(r"(?m)^##\s+\S", head)
+    section = head[:end.start()] if end else head
+    for line in section.splitlines():
+        line = line.strip()
+        if not line.startswith("- "):
+            continue
+        pm = re.search(r"PMID\s+(\d{6,9})", line)
+        if pm:
+            out.append({"pmid": pm.group(1), "text": line})
+    return out
 
 
 def norm(s: str) -> str:
@@ -101,7 +134,76 @@ def norm(s: str) -> str:
         .replace("\u2265", ">=").replace("\u2264", "<=").replace(",", "")
 
 
-def audit(blocks: list, src: dict) -> list:
+def _check_numbers(pmid: str, text: str, ab: str, findings: list,
+                   where: str) -> None:
+    """Every number in `text` must exist in the source abstract `ab`.
+
+    Core-number matching is lenient by design (a legit summary may expand a
+    unit — "2 wk" -> "2.0 weeks" — or pad a decimal, and spelled-out numbers
+    count). Two strictnesses on top: a stated TIME unit (weeks/months/years/
+    days) must appear next to the number in the source — "12 months" when the
+    abstract says "12 weeks" is a real error the core check misses — and a
+    stated % must appear as a percentage, not just as the bare number.
+    A PMID reference ("PMID 40222222") is an identifier, not a clinical
+    number, and is stripped before checking."""
+    words = {"one": "1", "two": "2", "three": "3", "four": "4",
+             "five": "5", "six": "6", "seven": "7", "eight": "8",
+             "nine": "9", "ten": "10"}
+    text = re.sub(r"PMID\s*\d{6,9}", "", norm(text) or "")
+    for tok in NUM_RE.findall(text):
+        t = tok.strip()
+        if not t or len(t) <= 1:
+            continue
+        core = re.match(r"\d+(?:\.\d+)?", t)
+        if not core:
+            continue
+        num = core.group(0)
+        spelled = [w for w, d in words.items() if d == num.split(".")[0]]
+        found_digits = (num in ab or num.rstrip("0").rstrip(".") in ab)
+        found = found_digits or any(w in ab.lower() for w in spelled)
+        if not found:
+            findings.append({"pmid": pmid, "level": "error",
+                             "issue": f"number '{t}' (core {num}) in {where} "
+                                      f"is NOT in the abstract"})
+            continue
+        # Unit check, only when the number was found as digits (a spelled-out
+        # match cannot be located reliably).
+        if not found_digits:
+            continue
+        unit_m = TIME_UNIT_RE.search(t)
+        if unit_m:
+            unit = unit_m.group(1).lower()
+            stem = next((k for k, pat in TIME_UNIT_VARIANTS.items()
+                         if re.fullmatch(pat, unit, re.I)), None)
+            if stem:
+                adj = re.search(
+                    rf"{re.escape(num)}\s*-?\s*(?:{TIME_UNIT_VARIANTS[stem]})"
+                    rf"\b", ab, re.I)
+                if not adj:
+                    findings.append({
+                        "pmid": pmid, "level": "error",
+                        "issue": f"number '{t}' in {where}: the unit "
+                                 f"('{unit}') does not appear next to {num} "
+                                 f"in the abstract"})
+        elif t.endswith("%"):
+            ab_pct = ab.replace(" %", "%")
+            if (f"{num}%" not in ab_pct
+                    and f"{num} percent" not in ab.lower()):
+                findings.append({
+                    "pmid": pmid, "level": "error",
+                    "issue": f"number '{t}' in {where}: no {num}% in the "
+                             f"abstract"})
+
+
+def audit(blocks: list, src: dict, truncated: dict | None = None,
+          focus: list | None = None) -> list:
+    """Trace digest numbers back to their PubMed abstracts.
+
+    `truncated` maps PMID -> the abstract text the model was actually given
+    (same truncation as the prompt). Numbers are checked against THAT text,
+    not the full abstract: a number that only appears past the truncation
+    point could not have been grounded, however correct it is. `focus` is
+    the Week-in-focus bullets from parse_focus_bullets()."""
     findings = []
     seen: set = set()
     for b in blocks:
@@ -118,7 +220,10 @@ def audit(blocks: list, src: dict) -> list:
                              "issue": "PMID not found on PubMed"})
             continue
         # numbers may legitimately come from the title (e.g. IL-23 in a title)
-        ab = norm(rec.get("abstract", "")) + " " + norm(rec.get("title", ""))
+        full = norm(rec.get("abstract", "")) + " " + norm(rec.get("title", ""))
+        trunc = truncated.get(b["pmid"]) if truncated else None
+        ab = (norm(trunc) + " " + norm(rec.get("title", ""))) \
+            if trunc is not None else full
         for field in ("what", "impact", "caveat"):
             if not b.get(field):
                 findings.append({"pmid": b["pmid"], "level": "warn",
@@ -132,28 +237,14 @@ def audit(blocks: list, src: dict) -> list:
                              "issue": f"journal mismatch: block says "
                                       f"'{stated[:60]}', PubMed says "
                                       f"'{rec['journal']}'"})
-        # numbers in the block's What-it-says must exist in the abstract
-        for tok in NUM_RE.findall(norm(b["what"])):
-            t = tok.strip()
-            if not t or len(t) <= 1:
-                continue
-            core = re.match(r"\d+(?:\.\d+)?", t)
-            if not core:
-                continue
-            num = core.group(0)
-            # Compare the NUMERIC CORE only: a legit summary may expand a unit
-            # ("2 wk" -> "2.0 weeks") or pad a decimal, which is not a
-            # hallucination. Also accept the spelled-out form (five <-> 5).
-            words = {"one": "1", "two": "2", "three": "3", "four": "4",
-                     "five": "5", "six": "6", "seven": "7", "eight": "8",
-                     "nine": "9", "ten": "10"}
-            spelled = [w for w, d in words.items() if d == num.split(".")[0]]
-            found = (num in ab or num.rstrip("0").rstrip(".") in ab
-                     or any(w in ab.lower() for w in spelled))
-            if not found:
-                findings.append({"pmid": b["pmid"], "level": "error",
-                                 "issue": f"number '{t}' (core {num}) in "
-                                          f"What-it-says is NOT in the abstract"})
+        # numbers in What-it-says, Practice impact AND Caveat must exist in
+        # the abstract — a hallucinated number in Practice impact ("reduce
+        # the dose by 50%") used to pass unchecked.
+        for field, label in (("what", "What-it-says"),
+                             ("impact", "Practice impact"),
+                             ("caveat", "Caveat")):
+            if b.get(field):
+                _check_numbers(b["pmid"], b[field], ab, findings, label)
         # confidence levels must not be invented/altered. Normalize phrasing
         # variants first: abstracts write "95% confidence interval(s)",
         # "95%CI", "95 % CI" as often as the canonical "95% CI" (live 09-21:
@@ -166,6 +257,20 @@ def audit(blocks: list, src: dict) -> list:
                 findings.append({"pmid": b["pmid"], "level": "error",
                                  "issue": f"'{cl}% CI' does not appear in the "
                                           f"abstract"})
+    # Week-in-focus bullets: same number check, against the cited item's
+    # abstract (truncated text when available).
+    for fb in focus or []:
+        rec = src.get(fb["pmid"], {})
+        if not rec:
+            findings.append({"pmid": fb["pmid"], "level": "error",
+                             "issue": "Week in focus: PMID not found on "
+                                      "PubMed"})
+            continue
+        trunc = truncated.get(fb["pmid"]) if truncated else None
+        ab = (norm(trunc) + " " + norm(rec.get("title", ""))) \
+            if trunc is not None else \
+            norm(rec.get("abstract", "")) + " " + norm(rec.get("title", ""))
+        _check_numbers(fb["pmid"], fb["text"], ab, findings, "Week in focus")
     return findings
 
 
