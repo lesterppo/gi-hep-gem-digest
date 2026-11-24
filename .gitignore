@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
-state/seen_ids.json
+# state/seen_ids.json is COMMITTED (not ignored): the workflow commits it
+# after every successful run, so dedup survives the 7-day actions/cache
+# eviction and the push resets GitHub's 60-day auto-disable clock.
 state/digest_*.md
 state/*.png
 smtp_pass.txt
