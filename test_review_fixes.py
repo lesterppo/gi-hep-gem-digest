@@ -208,5 +208,91 @@ st = g.send_email("subj", "<html>hi</html>",
 check("mismatched cids list does not raise; send fails cleanly",
       isinstance(st, str) and st.startswith("error:"), st)
 
+print("== digest_audit: focus bullets stop at item blocks (2026-11-25) ==")
+# Regression: parse_focus_bullets used to stop only at "## " headings, so it
+# swallowed every item block's "- **Citation**:" line (PMID + DOI + date)
+# as a "focus bullet" and the number check flagged the citation metadata
+# as untraced figures — 131 audit errors on the 2026-11-25 dry run, ~124
+# of them from swallowed citation lines.
+focus_txt = (
+    "## Week in focus\n"
+    "- Gut, PMID 40111111: 80% improved. Why it matters: start drug X.\n"
+    "- Lancet, PMID 40222222: 60% improved. Why it matters: start drug Y.\n"
+    "\n"
+    "### Guide A\n"
+    "- **Citation**: Gut - 2026-11-20 - PMID 40111111 "
+    "(https://pubmed.ncbi.nlm.nih.gov/40111111/) - DOI 10.1136/gut-2026-1 "
+    "(https://doi.org/10.1136/gut-2026-1)\n"
+    "- **What it says**: Use drug X in 80% of cases.\n"
+    "\n"
+    "### Trial B\n"
+    "- **Citation**: Lancet - 2026-11-20 - PMID 40222222 "
+    "(https://pubmed.ncbi.nlm.nih.gov/40222222/) - DOI 10.1016/S0140-6736(26)12345-6\n"
+    "- **What it says**: Drug Y improved survival 60% vs 40%.\n")
+fb2 = da.parse_focus_bullets(focus_txt)
+check("focus bullets stop at ### blocks (2 real bullets only)",
+      len(fb2) == 2 and {b["pmid"] for b in fb2} == {"40111111", "40222222"},
+      str([(b["pmid"], b["text"][:40]) for b in fb2]))
+
+print("== digest_audit: DOI / URL numbers are identifiers, not figures ==")
+findings_doi = []
+da._check_numbers("40111111",
+                  "See DOI 10.1136/gut-2026-1 and "
+                  "https://pubmed.ncbi.nlm.nih.gov/40111111/ for details. "
+                  "Drug X helped 80% of cases.",
+                  "BACKGROUND: x. RESULTS: 80% of cases. CONCLUSIONS: z.",
+                  findings_doi, "What-it-says")
+check("DOI + pubmed URL digits produce no errors",
+      not findings_doi, str(findings_doi))
+
+print("== digest_audit: bracketed IQR between number and unit ==")
+# "5.7 [2.3-11.5] months" — median [IQR] vs median [IQR] months.
+findings_unit = []
+da._check_numbers("40111111",
+                  "Median survival 7.1 vs 5.7 months.",
+                  "Median survival 7.1 [3.5-14.8] vs 5.7 [2.3-11.5] months.",
+                  findings_unit, "What-it-says")
+check("bracketed range between number and unit passes",
+      not findings_unit, str(findings_unit))
+findings_unit2 = []
+da._check_numbers("40111111",
+                  "Follow-up 12 months.",
+                  "Follow-up 12 weeks.",
+                  findings_unit2, "What-it-says")
+check("genuine unit mismatch still flagged",
+      any("12 months" in f["issue"] for f in findings_unit2),
+      str(findings_unit2))
+
+print("== digest_audit: focus audit no longer flags citation metadata ==")
+fb_src = {"40111111": {"journal": "Gut",
+                       "abstract": "BACKGROUND: x. METHODS: y. "
+                                   "RESULTS: 80% improved. CONCLUSIONS: z.",
+                       "title": "Guide A", "pubtypes": []},
+          "40222222": {"journal": "Lancet",
+                       "abstract": "Drug Y improved survival 60% vs 40%.",
+                       "title": "Trial B", "pubtypes": []}}
+fb_blocks = da.parse_blocks(focus_txt)
+fb_find = da.audit(fb_blocks, fb_src, truncated={
+    "40111111": fb_src["40111111"]["abstract"],
+    "40222222": fb_src["40222222"]["abstract"]},
+    focus=da.parse_focus_bullets(focus_txt))
+fb_errs = [f for f in fb_find if f["level"] == "error"]
+check("focus audit: no DOI/PMID/date errors",
+      not any("10.1136" in f["issue"] or "2026" in f["issue"]
+              or "40111111" in f["issue"] or "40222222" in f["issue"]
+              for f in fb_errs),
+      str([f["issue"] for f in fb_errs]))
+fb_bad = da.audit(
+    fb_blocks, fb_src, truncated={
+        "40111111": fb_src["40111111"]["abstract"],
+        "40222222": fb_src["40222222"]["abstract"]},
+    focus=da.parse_focus_bullets(
+        "## Week in focus\n"
+        "- Gut, PMID 40111111: 99% improved. Why it matters: start drug X.\n"))
+fb_bad_errs = [f for f in fb_bad if f["level"] == "error"]
+check("focus audit: genuinely untraced focus number still flagged",
+      any("99%" in f["issue"] for f in fb_bad_errs),
+      str([f["issue"] for f in fb_bad_errs]))
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
