@@ -117,7 +117,13 @@ def parse_focus_bullets(text: str) -> list:
     if not m:
         return out
     head = text[m.end():]
-    end = re.search(r"(?m)^##\s+\S", head)
+    # The section ends at the NEXT heading of any level — "## Guideline
+    # watch" or the first "### " item block. The old pattern only stopped
+    # at "## " headings, so it swallowed every item block's "- **Citation**:"
+    # line (PMID + DOI + date) as a "focus bullet" and the number check
+    # flagged the citation metadata as untraced figures (2026-11-25 dry
+    # run: 131 audit errors, ~124 of them from swallowed citation lines).
+    end = re.search(r"(?m)^#{1,6}\s", head)
     section = head[:end.start()] if end else head
     for line in section.splitlines():
         line = line.strip()
@@ -150,6 +156,12 @@ def _check_numbers(pmid: str, text: str, ab: str, findings: list,
              "five": "5", "six": "6", "seven": "7", "eight": "8",
              "nine": "9", "ten": "10"}
     text = re.sub(r"PMID\s*\d{6,9}", "", norm(text) or "")
+    # DOIs and URLs are identifiers, not clinical numbers: a focus bullet or
+    # a citation line carries "10.1001/jamanetworkopen.2026.41241" and a
+    # pubmed URL whose digits must never be checked against the abstract
+    # (the same reason PMIDs are stripped above).
+    text = re.sub(r"10\.\d{4,9}/[^\s,;)\]]+", "", text)
+    text = re.sub(r"https?://[^\s]+", "", text)
     for tok in NUM_RE.findall(text):
         t = tok.strip()
         if not t or len(t) <= 1:
@@ -176,8 +188,14 @@ def _check_numbers(pmid: str, text: str, ab: str, findings: list,
             stem = next((k for k, pat in TIME_UNIT_VARIANTS.items()
                          if re.fullmatch(pat, unit, re.I)), None)
             if stem:
+                # A bracketed IQR/range may sit between the number and its
+                # unit — "5.7 [2.3-11.5] months" (median [IQR] vs median
+                # [IQR] months) — so allow one "[...]" group there. Without
+                # it the strict adjacent-unit rule flags a correctly stated
+                # median as unverified (live 2026-11-25: '5.7 months').
                 adj = re.search(
-                    rf"{re.escape(num)}\s*-?\s*(?:{TIME_UNIT_VARIANTS[stem]})"
+                    rf"{re.escape(num)}\s*(?:\[[^\]]*\]\s*)?-?\s*"
+                    rf"(?:{TIME_UNIT_VARIANTS[stem]})"
                     rf"\b", ab, re.I)
                 if not adj:
                     findings.append({
