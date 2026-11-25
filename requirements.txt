@@ -4,11 +4,15 @@
 #
 # Versions are PINNED (==): upstream API churn is frequent (the repo's own
 # nlm.py v5/v6/v7 changelogs document it), and an unpinned major bump can
-# break the run. Pins are the versions the 2026-11-24 dry run verified green
-# after the review pass; bump one at a time and re-run a dry run.
+# break the run. Pins must satisfy the libraries' own requirements:
+# gemini-webapi 2.1.1 needs curl-cffi~=0.16.2 AND loguru~=0.7.3, so
+# curl_cffi==0.17.0 / loguru==0.8.0 (pinned 2026-11-24) broke pip
+# resolution and killed the 2026-11-25 dry run at Install dependencies.
+# Fixed 2026-11-25 and verified by a fresh-venv pip --dry-run.
+# Bump one at a time and re-run a dry run.
 gemini-webapi==2.1.1
-curl_cffi==0.17.0
-loguru==0.8.0
+curl_cffi==0.16.2
+loguru==0.7.3
 browser-cookie3==0.20.1
 matplotlib==3.11.2
 notebooklm-py==0.8.6
