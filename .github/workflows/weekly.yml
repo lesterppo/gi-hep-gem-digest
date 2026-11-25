@@ -164,6 +164,13 @@ jobs:
           key: gihep-seen-${{ github.run_id }}
           restore-keys: gihep-seen-
 
+      - name: Clear stale run outputs
+        # The seen-state cache restores the whole state/ dir, so a previous
+        # run's digest_b*.md / audit_*.json would survive into this run and
+        # pollute the QA artifact upload (2026-11-25 dry run shipped a stale
+        # digest_b2.md from 2026-11-23). seen_ids.json itself must stay.
+        run: rm -f state/digest_b*.md state/audit_*.json
+
       - name: Run GI & Hepatology weekly digest
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
