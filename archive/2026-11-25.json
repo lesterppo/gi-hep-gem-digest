@@ -1,0 +1,143 @@
+{
+ "date": "2026-11-25",
+ "window_days": 14,
+ "date_range": "2026-11-11 to 2026-11-25",
+ "items_analysed": [
+  "43038485",
+  "42975907",
+  "43073789",
+  "43069022",
+  "43076449",
+  "43004512",
+  "43024239",
+  "42949746",
+  "43073813",
+  "43016244",
+  "43004594",
+  "43077161"
+ ],
+ "items_unanalysed": [],
+ "items_dropped_over_capacity": [],
+ "retractions": [
+  "43074705",
+  "42995666",
+  "43023957",
+  "43013368",
+  "43004036",
+  "43007245",
+  "43074410",
+  "42998369",
+  "42977502",
+  "43042480",
+  "42973142",
+  "42951878",
+  "42928576",
+  "42981612",
+  "42962467",
+  "42962466",
+  "43004593",
+  "43004592",
+  "43004591"
+ ],
+ "backends": [
+  "web"
+ ],
+ "audit_errors": [
+  {
+   "pmid": "43038485",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43038485",
+   "level": "error",
+   "issue": "'95% CI' does not appear in the abstract"
+  },
+  {
+   "pmid": "42975907",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "42975907",
+   "level": "error",
+   "issue": "number '55' (core 55) in Caveat is NOT in the abstract"
+  },
+  {
+   "pmid": "43004512",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43004512",
+   "level": "error",
+   "issue": "'95% CI' does not appear in the abstract"
+  },
+  {
+   "pmid": "43073813",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43073813",
+   "level": "error",
+   "issue": "'95% CI' does not appear in the abstract"
+  },
+  {
+   "pmid": "43073789",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43073789",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43073789",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43073789",
+   "level": "error",
+   "issue": "'95% CI' does not appear in the abstract"
+  },
+  {
+   "pmid": "43073789",
+   "level": "error",
+   "issue": "'95% CI' does not appear in the abstract"
+  },
+  {
+   "pmid": "43073789",
+   "level": "error",
+   "issue": "'95% CI' does not appear in the abstract"
+  },
+  {
+   "pmid": "43076449",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43016244",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43004594",
+   "level": "error",
+   "issue": "number '95%' (core 95) in What-it-says is NOT in the abstract"
+  },
+  {
+   "pmid": "43004594",
+   "level": "error",
+   "issue": "'95% CI' does not appear in the abstract"
+  }
+ ],
+ "audit_warnings": [],
+ "dashboards": [
+  "poster"
+ ],
+ "dashboards_reused": [],
+ "email_status": "sent"
+}
